@@ -94,12 +94,18 @@ def process_video(url, chat_id):
                     f"✅ تم إرسال الكليب {i+1} من {clip_count}"
                 )
 
-        except Exception:
-            send_message(
-                chat_id,
-                "❌ فشلت المعالجة. قد يكون الرابط غير مدعوم "
-                "أو الفيديو طويلاً أو حجمه كبيراً."
-            )
+        
+except Exception as e:
+    import traceback
+    traceback.print_exc()
+    print(f"PROCESSING ERROR: {type(e).__name__}: {e}", flush=True)
+
+    send_message(
+        chat_id,
+        "❌ حدث خطأ أثناء المعالجة. "
+        "راجع سجلات الخادم لمعرفة السبب."
+    )
+
 
 @app.route("/", methods=["GET"])
 def home():
