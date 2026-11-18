@@ -12,7 +12,6 @@ DENO_PATH = "/opt/render/project/src/.deno/bin/deno"
 
 
 def _cookie_copy(options):
-    """Copy Render's read-only secret into a writable temporary file."""
     if not (os.path.isfile(COOKIES_FILE) and os.access(COOKIES_FILE, os.R_OK)):
         return None
     fd, path = tempfile.mkstemp(prefix="yt_cookies_", suffix=".txt", dir="/tmp")
@@ -23,7 +22,7 @@ def _cookie_copy(options):
 
 
 def _choose_format(info):
-    """Prefer a muxed live stream up to 720p/30fps to reduce bandwidth."""
+    """السماح بسحب بث يصل إلى 1080p/30fps للحفاظ على الجودة العالية."""
     direct = info.get("url")
     formats = info.get("formats") or []
 
@@ -38,15 +37,16 @@ def _choose_format(info):
         height = int(fmt.get("height") or 0)
         fps = float(fmt.get("fps") or 0)
         protocol = str(fmt.get("protocol") or "")
-        # Prefer streams that are already muxed and not above 720p.
-        within_target = 1 if (height == 0 or height <= 720) else 0
+        
+        # السماح بارتفاع حتى 1080p كحد أقصى للحفاظ على دقة عالية
+        within_target = 1 if (height == 0 or height <= 1080) else 0
         fps_target = 1 if (fps == 0 or fps <= 30) else 0
         hls = 1 if ("m3u8" in protocol or "http" in protocol) else 0
         candidates.append((
             within_target,
             fps_target,
             hls,
-            min(height or 720, 720),
+            min(height or 1080, 1080),
             min(fps or 30, 30),
             fmt
         ))
@@ -69,14 +69,13 @@ def _choose_format(info):
             "height": info.get("height"),
         }
 
-    # Last resort: a video-only stream can still be captured; audio is optional.
     video_only = [
         f for f in formats
         if f.get("url") and f.get("vcodec") not in (None, "none")
     ]
     if video_only:
         video_only.sort(
-            key=lambda f: min(int(f.get("height") or 720), 720),
+            key=lambda f: min(int(f.get("height") or 1080), 1080),
             reverse=True
         )
         chosen = video_only[0]
@@ -91,7 +90,6 @@ def _choose_format(info):
 
 
 def get_live_stream(url):
-    """Extract a direct URL without forcing yt-dlp's 'best' format selector."""
     if "youtube.com" not in url and "youtu.be" not in url:
         raise ValueError("هذا الإصدار يدعم روابط YouTube Live فقط.")
 
@@ -116,7 +114,6 @@ def get_live_stream(url):
     try:
         cookie_path = _cookie_copy(options)
         with yt_dlp.YoutubeDL(options) as ydl:
-            # process=False avoids an early format-selection failure.
             info = ydl.extract_info(url, download=False, process=False)
     finally:
         if cookie_path and os.path.exists(cookie_path):
@@ -149,7 +146,6 @@ def get_live_stream(url):
 
 
 def start_live_capture(url, output_dir, segment_seconds=60):
-    """Start low-overhead stream-copy capture into sequential MPEG-TS segments."""
     segment_seconds = int(segment_seconds)
     if segment_seconds != 60:
         raise ValueError("مدة أجزاء البث مضبوطة على 60 ثانية.")
@@ -209,7 +205,6 @@ def start_live_capture(url, output_dir, segment_seconds=60):
 
 
 def stop_live_capture(process):
-    """Stop FFmpeg safely and allow it to flush its current segment."""
     if process is None or process.poll() is not None:
         return False
     process.terminate()
