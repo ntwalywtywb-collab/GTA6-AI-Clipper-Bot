@@ -19,32 +19,25 @@ API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 COOKIES_FILE = "/etc/secrets/m.youtube.com_cookies.txt"
 
-DENO_PATH = os.path.expanduser("~/.deno/bin/deno")
+# المسار الصحيح لـ Deno على Render
+DENO_PATH = "/opt/render/.deno/bin/deno"
 
 
 def send_message(chat_id, text):
     try:
         response = requests.post(
             f"{API}/sendMessage",
-            json={
-                "chat_id": chat_id,
-                "text": text
-            },
+            json={"chat_id": chat_id, "text": text},
             timeout=30
         )
         response.raise_for_status()
-
     except Exception as e:
         print(f"Telegram message error: {e}", flush=True)
 
 
 def process_video(url, chat_id):
-
     try:
-        send_message(
-            chat_id,
-            "⏳ بدأت معالجة الفيديو..."
-        )
+        send_message(chat_id, "⏳ بدأت معالجة الفيديو...")
 
         with tempfile.TemporaryDirectory() as folder:
 
@@ -55,33 +48,45 @@ def process_video(url, chat_id):
                 "source.%(ext)s"
             )
 
-            # إعدادات yt-dlp
+            # التحقق من Deno
+            if os.path.isfile(DENO_PATH) and os.access(DENO_PATH, os.X_OK):
+                print(f"Deno found: {DENO_PATH}", flush=True)
+
+                deno_test = subprocess.run(
+                    [DENO_PATH, "--version"],
+                    capture_output=True,
+                    text=True,
+                    timeout=15
+                )
+
+                print(
+                    f"Deno version: {deno_test.stdout.strip()}",
+                    flush=True
+                )
+            else:
+                raise Exception(
+                    f"Deno missing or not executable: {DENO_PATH}"
+                )
+
             options = {
                 "outtmpl": output,
-
                 "format": "bestvideo*+bestaudio/best",
-
                 "noplaylist": True,
-
                 "quiet": False,
                 "no_warnings": False,
                 "verbose": True,
-
                 "socket_timeout": 60,
                 "retries": 3,
                 "fragment_retries": 3,
-
                 "ffmpeg_location": ffmpeg,
                 "merge_output_format": "mp4",
 
-                # تفعيل Deno
                 "js_runtimes": {
                     "deno": {
                         "path": DENO_PATH
                     }
                 },
 
-                # السماح بتحميل مكونات حل تحديات YouTube
                 "remote_components": {
                     "ejs:github"
                 }
@@ -89,7 +94,6 @@ def process_video(url, chat_id):
 
             # إعداد Cookies ليوتيوب
             if "youtube.com" in url or "youtu.be" in url:
-
                 if os.path.isfile(COOKIES_FILE):
 
                     writable_cookies = os.path.join(
@@ -108,43 +112,20 @@ def process_video(url, chat_id):
                         "YouTube cookies copied to writable folder.",
                         flush=True
                     )
-
                 else:
-
                     print(
                         "YouTube cookies file not found.",
                         flush=True
                     )
 
-            # التحقق من Deno
-            if os.path.isfile(DENO_PATH):
-
-                print(
-                    f"Deno found: {DENO_PATH}",
-                    flush=True
-                )
-
-            else:
-
-                print(
-                    "WARNING: Deno executable not found at expected path.",
-                    flush=True
-                )
-
-            # تحميل الفيديو
-            print(
-                "Starting video extraction...",
-                flush=True
-            )
+            print("Starting video extraction...", flush=True)
 
             with yt_dlp.YoutubeDL(options) as ydl:
-
                 info = ydl.extract_info(
                     url,
                     download=True
                 )
 
-            # البحث عن الملف المحمل
             files = glob.glob(
                 os.path.join(folder, "source.*")
             )
@@ -157,7 +138,6 @@ def process_video(url, chat_id):
             ]
 
             if not files:
-
                 raise Exception(
                     "Downloaded video file not found"
                 )
@@ -168,7 +148,6 @@ def process_video(url, chat_id):
             )
 
             duration = info.get("duration") or 45
-
             clip_length = 45
 
             clip_count = min(
@@ -187,7 +166,7 @@ def process_video(url, chat_id):
                 "🎬 تم تحميل الفيديو! جاري تجهيز المقاطع..."
             )
 
-            # إنشاء المقاطع
+            # إنشاء وإرسال المقاطع
             for i in range(clip_count):
 
                 start = i * clip_length
@@ -203,18 +182,14 @@ def process_video(url, chat_id):
                     "-ss", str(start),
                     "-i", filename,
                     "-t", str(clip_length),
-
                     "-vf",
                     "scale=720:1280:force_original_aspect_ratio=increase,"
                     "crop=720:1280",
-
                     "-c:v", "libx264",
                     "-preset", "ultrafast",
                     "-crf", "28",
-
                     "-c:a", "aac",
                     "-movflags", "+faststart",
-
                     result
                 ]
 
@@ -226,20 +201,11 @@ def process_video(url, chat_id):
                     timeout=600
                 )
 
-                # إرسال المقطع إلى Telegram
                 with open(result, "rb") as video:
-
                     response = requests.post(
                         f"{API}/sendVideo",
-
-                        data={
-                            "chat_id": chat_id
-                        },
-
-                        files={
-                            "video": video
-                        },
-
+                        data={"chat_id": chat_id},
+                        files={"video": video},
                         timeout=300
                     )
 
@@ -248,7 +214,6 @@ def process_video(url, chat_id):
                     result_data = response.json()
 
                     if not result_data.get("ok"):
-
                         raise Exception(
                             f"Telegram upload failed: {result_data}"
                         )
@@ -280,7 +245,6 @@ def process_video(url, chat_id):
 
 @app.route("/", methods=["GET"])
 def home():
-
     return "GTA 6 AI Clipper Bot is running!"
 
 
@@ -288,11 +252,9 @@ def home():
 def webhook():
 
     data = request.get_json(silent=True) or {}
-
     message = data.get("message", {})
 
     chat_id = message.get("chat", {}).get("id")
-
     text = message.get("text", "").strip()
 
     if chat_id and text:
