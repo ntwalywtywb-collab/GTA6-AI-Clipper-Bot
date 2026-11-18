@@ -1,6 +1,6 @@
-
 import os
 import subprocess
+
 import yt_dlp
 import imageio_ffmpeg
 
@@ -8,14 +8,11 @@ import imageio_ffmpeg
 COOKIES_FILE = "/etc/secrets/m.youtube.com_cookies.txt"
 DENO_PATH = "/opt/render/project/src/.deno/bin/deno"
 
-SEGMENT_SECONDS = 60
-
 
 def get_live_stream(url):
-    """استخراج رابط بث YouTube المباشر."""
-
+    """Extract the direct URL and headers for an active YouTube Live stream."""
     if "youtube.com" not in url and "youtu.be" not in url:
-        raise ValueError("هذا الملف يدعم روابط YouTube فقط.")
+        raise ValueError("This module currently supports YouTube Live URLs only.")
 
     options = {
         "format": "best",
@@ -29,9 +26,7 @@ def get_live_stream(url):
     }
 
     if os.path.isfile(DENO_PATH):
-        options["js_runtimes"] = {
-            "deno": {"path": DENO_PATH}
-        }
+        options["js_runtimes"] = {"deno": {"path": DENO_PATH}}
         options["remote_components"] = ["ejs:github"]
 
     if os.path.isfile(COOKIES_FILE):
@@ -41,12 +36,11 @@ def get_live_stream(url):
         info = ydl.extract_info(url, download=False)
 
     if info.get("live_status") != "is_live":
-        raise RuntimeError("الرابط ليس بثاً مباشراً نشطاً.")
+        raise RuntimeError("The supplied URL is not an active live stream.")
 
     stream_url = info.get("url")
-
     if not stream_url:
-        raise RuntimeError("تعذر استخراج رابط البث.")
+        raise RuntimeError("Could not extract a direct live-stream URL.")
 
     return {
         "url": stream_url,
@@ -55,40 +49,30 @@ def get_live_stream(url):
     }
 
 
-def start_live_capture(url, output_dir):
+def start_live_capture(url, output_dir, segment_seconds=60):
     """
-    بدء التقاط البث وتقسيمه إلى أجزاء مدة كل منها 60 ثانية.
+    Start capturing an active live stream into consecutive 60-second files.
+    Returns a dictionary with the FFmpeg process and output pattern.
     """
+    if int(segment_seconds) != 60:
+        raise ValueError("Live capture segments are configured for 60 seconds.")
 
     os.makedirs(output_dir, exist_ok=True)
 
     ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
-
     live = get_live_stream(url)
 
-    output_pattern = os.path.join(
-        output_dir,
-        "live_%05d.ts"
-    )
+    output_pattern = os.path.join(output_dir, "live_%05d.ts")
 
     headers = live.get("headers", {})
-
     header_text = "".join(
-        f"{key}: {value}\r\n"
-        for key, value in headers.items()
+        f"{key}: {value}\r\n" for key, value in headers.items()
     )
 
-    command = [
-        ffmpeg,
-        "-hide_banner",
-        "-loglevel", "warning",
-    ]
+    command = [ffmpeg, "-hide_banner", "-loglevel", "warning"]
 
     if header_text:
-        command.extend([
-            "-headers",
-            header_text
-        ])
+        command.extend(["-headers", header_text])
 
     command.extend([
         "-i", live["url"],
@@ -96,7 +80,7 @@ def start_live_capture(url, output_dir):
         "-map", "0:a?",
         "-c", "copy",
         "-f", "segment",
-        "-segment_time", str(SEGMENT_SECONDS),
+        "-segment_time", "60",
         "-reset_timestamps", "1",
         "-segment_format", "mpegts",
         output_pattern,
@@ -105,20 +89,20 @@ def start_live_capture(url, output_dir):
     process = subprocess.Popen(
         command,
         stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
     )
 
     return {
         "process": process,
         "output_pattern": output_pattern,
         "title": live["title"],
-        "segment_seconds": SEGMENT_SECONDS,
+        "segment_seconds": 60,
     }
 
 
 def stop_live_capture(process):
-    """إيقاف التقاط البث."""
-
+    """Stop the FFmpeg live-capture process safely."""
     if process is None or process.poll() is not None:
         return False
 
@@ -126,7 +110,6 @@ def stop_live_capture(process):
 
     try:
         process.wait(timeout=10)
-
     except subprocess.TimeoutExpired:
         process.kill()
         process.wait()
