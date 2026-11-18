@@ -19,8 +19,8 @@ API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 COOKIES_FILE = "/etc/secrets/m.youtube.com_cookies.txt"
 
-# المسار الصحيح لـ Deno على Render
-DENO_PATH = "/opt/render/.deno/bin/deno"
+# مسار Deno الصحيح على Render
+DENO_PATH = "/opt/render/project/src/.deno/bin/deno"
 
 
 def send_message(chat_id, text):
@@ -48,21 +48,24 @@ def process_video(url, chat_id):
                 "source.%(ext)s"
             )
 
-            # التحقق من Deno
+            # التحقق من وجود Deno وتشغيله
             if os.path.isfile(DENO_PATH) and os.access(DENO_PATH, os.X_OK):
+
                 print(f"Deno found: {DENO_PATH}", flush=True)
 
                 deno_test = subprocess.run(
                     [DENO_PATH, "--version"],
                     capture_output=True,
                     text=True,
-                    timeout=15
+                    timeout=15,
+                    check=True
                 )
 
                 print(
                     f"Deno version: {deno_test.stdout.strip()}",
                     flush=True
                 )
+
             else:
                 raise Exception(
                     f"Deno missing or not executable: {DENO_PATH}"
@@ -87,13 +90,12 @@ def process_video(url, chat_id):
                     }
                 },
 
-                "remote_components": {
-                    "ejs:github"
-                }
+                "remote_components": ["ejs:github"]
             }
 
             # إعداد Cookies ليوتيوب
             if "youtube.com" in url or "youtu.be" in url:
+
                 if os.path.isfile(COOKIES_FILE):
 
                     writable_cookies = os.path.join(
@@ -112,6 +114,7 @@ def process_video(url, chat_id):
                         "YouTube cookies copied to writable folder.",
                         flush=True
                     )
+
                 else:
                     print(
                         "YouTube cookies file not found.",
@@ -202,6 +205,7 @@ def process_video(url, chat_id):
                 )
 
                 with open(result, "rb") as video:
+
                     response = requests.post(
                         f"{API}/sendVideo",
                         data={"chat_id": chat_id},
@@ -252,6 +256,7 @@ def home():
 def webhook():
 
     data = request.get_json(silent=True) or {}
+
     message = data.get("message", {})
 
     chat_id = message.get("chat", {}).get("id")
