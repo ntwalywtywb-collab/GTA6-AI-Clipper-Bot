@@ -15,14 +15,12 @@ app = Flask(__name__)
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
+COOKIES_FILE = "/etc/secrets/m.youtube.com_cookies.txt"
+
 
 def send_message(chat_id, text):
-    if not BOT_TOKEN:
-        print("ERROR: BOT_TOKEN is missing", flush=True)
-        return
-
     try:
-        requests.post(
+        response = requests.post(
             f"{API}/sendMessage",
             json={
                 "chat_id": chat_id,
@@ -30,8 +28,10 @@ def send_message(chat_id, text):
             },
             timeout=30
         )
+        response.raise_for_status()
+
     except Exception as e:
-        print(f"Message error: {e}", flush=True)
+        print(f"Telegram message error: {e}", flush=True)
 
 
 def process_video(url, chat_id):
@@ -41,7 +41,10 @@ def process_video(url, chat_id):
 
         with tempfile.TemporaryDirectory() as folder:
 
-            output = os.path.join(folder, "source.%(ext)s")
+            output = os.path.join(
+                folder,
+                "source.%(ext)s"
+            )
 
             options = {
                 "outtmpl": output,
@@ -51,8 +54,16 @@ def process_video(url, chat_id):
                 "no_warnings": True,
                 "socket_timeout": 60,
                 "retries": 3,
-                "merge_output_format": "mp4"
+                "merge_output_format": "mp4",
             }
+
+            # استخدام Cookies لروابط YouTube فقط
+            if "youtube.com" in url or "youtu.be" in url:
+                if os.path.isfile(COOKIES_FILE):
+                    options["cookiefile"] = COOKIES_FILE
+                    print("YouTube cookies file found.", flush=True)
+                else:
+                    print("YouTube cookies file not found.", flush=True)
 
             with yt_dlp.YoutubeDL(options) as ydl:
                 info = ydl.extract_info(
@@ -76,12 +87,14 @@ def process_video(url, chat_id):
             filename = files[0]
 
             duration = info.get("duration") or 45
-
             clip_length = 45
 
             clip_count = min(
                 10,
-                max(1, int((duration + clip_length - 1) // clip_length))
+                max(
+                    1,
+                    int((duration + clip_length - 1) // clip_length)
+                )
             )
 
             ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
@@ -156,7 +169,6 @@ def process_video(url, chat_id):
     except Exception as e:
 
         import traceback
-
         traceback.print_exc()
 
         print(
@@ -172,7 +184,6 @@ def process_video(url, chat_id):
 
 @app.route("/", methods=["GET"])
 def home():
-
     return "GTA 6 AI Clipper Bot is running!"
 
 
