@@ -7,9 +7,12 @@ import shutil
 import traceback
 import time
 import uuid
+import gc
 import requests
 import yt_dlp
 import imageio_ffmpeg
+import cv2
+import numpy as np
 
 from flask import Flask, request
 from live_stream import start_live_capture, stop_live_capture
@@ -35,6 +38,9 @@ pending_lock = threading.Lock()
 JOBS = {}
 JOBS_LOCK = threading.Lock()
 
+# جعل وضع "ملء الشاشة مع توسيط الشخصية" هو الافتراضي تلقائياً
+USER_PREFERENCES = {}
+
 
 def telegram_request(method, payload=None, timeout=30):
     response = requests.post(f"{API}/{method}", json=payload or {}, timeout=timeout)
@@ -56,7 +62,6 @@ def send_message(chat_id, message, reply_markup=None):
 
 
 def answer_callback_query(callback_id, message=None):
-    """تعديل آمن لتجاهل أخطاء انتهاء صلاحية الأزرار لتفادي خطأ 400"""
     payload = {"callback_query_id": callback_id}
     if message:
         payload["text"] = message
@@ -67,12 +72,15 @@ def answer_callback_query(callback_id, message=None):
 
 
 def send_document(chat_id, filename, caption=None):
+    if not os.path.exists(filename):
+        raise FileNotFoundError(f"الملف غير موجود للإرسال: {filename}")
+    
     with open(filename, "rb") as document:
         response = requests.post(
             f"{API}/sendDocument",
             data={"chat_id": chat_id, "caption": caption or ""},
             files={"document": (os.path.basename(filename), document, "application/octet-stream")},
-            timeout=(30, 600)
+            timeout=(30, 900)
         )
     response.raise_for_status()
     result = response.json()
@@ -140,9 +148,22 @@ def run_ffmpeg(chat_id, command, timeout=900):
             raise RuntimeError(f"FFmpeg failed (code {process.returncode}): {details}")
 
 
+def get_ffmpeg_filter(chat_id):
+    """الوضع الافتراضي: ملء الشاشة العمودية مع توسيط الشخصية تلقائياً"""
+    mode = USER_PREFERENCES.get(chat_id, "fullscreen")
+    
+    if mode == "facecam":
+        return "scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2,fps=30"
+    elif mode == "tracking":
+        return "crop=ih*9/16:ih:(iw-ih*9/16)/2:0,scale=720:1280,fps=30"
+    else:
+        # الوضع الافتراضي التلقائي: ملء الشاشة العمودية بقياس تيك توك وتوسيط المحتوى
+        return "scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280,fps=30"
+
+
 def process_recorded_video(url, chat_id):
     try:
-        send_message(chat_id, "⏳ بدأت معالجة الفيديو المسجل بدقة 720p (مناسبة لخوادم Render). مدة كل مقطع 60 ثانية.")
+        send_message(chat_id, "⏳ بدأت معالجة الفيديو المسجل وتوسيط الشخصية تلقائياً (720p)...")
         with tempfile.TemporaryDirectory() as folder:
             ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
             output = os.path.join(folder, "source.%(ext)s")
@@ -197,33 +218,21 @@ def process_recorded_video(url, chat_id):
             clip_count = min(10, max(1, int(
                 (duration + CLIP_LENGTH_SECONDS - 1) // CLIP_LENGTH_SECONDS
             )))
-            send_message(
-                chat_id,
-                f"🎬 اكتمل التحميل. إجمالي المقاطع: {clip_count}.\n"
-                f"📋 الحالة: 0 من {clip_count} مكتملة — المتبقي {clip_count}."
-            )
+            send_message(chat_id, f"🎬 اكتمل التحميل. إجمالي المقاطع: {clip_count}.")
 
             completed = 0
             for i in range(clip_count):
                 if is_stopped(chat_id):
                     raise InterruptedError("تم إيقاف العمل.")
 
-                remaining_before = clip_count - completed
-                send_message(
-                    chat_id,
-                    f"⚙️ جاري تجهيز المقطع {i + 1} من {clip_count}.\n"
-                    f"📋 المقاطع المكتملة: {completed} — المتبقية: {remaining_before}."
-                )
-
                 start = i * CLIP_LENGTH_SECONDS
                 result = os.path.join(folder, f"clip_{i + 1}.mp4")
                 
-                # تصميم المنتصف والتأطير بدقة 720p
+                vf_filter = get_ffmpeg_filter(chat_id)
                 command = [
                     ffmpeg, "-y", "-ss", str(start), "-i", filename,
                     "-t", str(CLIP_LENGTH_SECONDS),
-                    "-vf",
-                    "scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2,fps=30",
+                    "-vf", vf_filter,
                     "-c:v", "libx264", "-preset", "veryfast", "-crf", "26",
                     "-threads", "2", "-pix_fmt", "yuv420p",
                     "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", result
@@ -234,35 +243,35 @@ def process_recorded_video(url, chat_id):
                     raise InterruptedError("تم إيقاف العمل.")
 
                 send_document(chat_id, result, f"المقطع {i + 1} من {clip_count} — 720p")
-                completed += 1
-                send_message(
-                    chat_id,
-                    f"✅ تم إرسال المقطع {completed} من {clip_count}.\n"
-                    f"📋 المتبقي: {clip_count - completed} مقطع."
-                )
+                
+                try:
+                    if os.path.exists(result):
+                        os.remove(result)
+                except Exception:
+                    pass
 
-            send_message(chat_id, "🎉 انتهت معالجة الفيديو المسجل وإرسال جميع المقاطع!")
+                completed += 1
+                gc.collect()
+
+            send_message(chat_id, "🎉 انتهت معالجة جميع المقاطع بنجاح!")
 
     except InterruptedError:
         send_message(chat_id, "⏹️ تم إيقاف المعالجة.")
     except Exception as exc:
         traceback.print_exc()
-        print(f"RECORDED ERROR: {type(exc).__name__}: {exc}", flush=True)
-        if is_stopped(chat_id):
-            send_message(chat_id, "⏹️ تم إيقاف المعالجة.")
-        else:
-            send_message(chat_id, f"❌ فشلت معالجة الفيديو المسجل: {type(exc).__name__}: {exc}")
+        send_message(chat_id, f"❌ فشلت معالجة الفيديو: {type(exc).__name__}: {exc}")
     finally:
+        gc.collect()
         with JOBS_LOCK:
             JOBS.pop(chat_id, None)
 
 
 def convert_live_segment(chat_id, segment_file, output_file, ffmpeg):
+    vf_filter = get_ffmpeg_filter(chat_id)
     command = [
         ffmpeg, "-y", "-i", segment_file,
         "-map", "0:v:0", "-map", "0:a?",
-        "-vf",
-        "scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2,fps=30",
+        "-vf", vf_filter,
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "28",
         "-threads", "2", "-pix_fmt", "yuv420p",
         "-c:a", "aac", "-b:a", "128k",
@@ -275,28 +284,16 @@ def process_youtube_live(url, chat_id):
     capture_process = None
     sent_count = 0
     try:
-        send_message(
-            chat_id,
-            "🔴 جاري الاتصال ببث YouTube Live (دقة 720p).\n"
-            "سيتم استقبال المقاطع وتحويلها وإرسالها تباعاً، مدة كل مقطع نحو 60 ثانية."
-        )
-
+        send_message(chat_id, "🔴 جاري الاتصال ببث YouTube Live وتوسيط الشخصية تلقائياً...")
         with tempfile.TemporaryDirectory() as folder:
             capture_dir = os.path.join(folder, "live_segments")
             os.makedirs(capture_dir, exist_ok=True)
 
-            capture = start_live_capture(
-                url, capture_dir, segment_seconds=LIVE_SEGMENT_SECONDS
-            )
+            capture = start_live_capture(url, capture_dir, segment_seconds=LIVE_SEGMENT_SECONDS)
             capture_process = capture["process"]
             register_process(chat_id, capture_process)
 
-            send_message(
-                chat_id,
-                f"📡 تم الاتصال بالبث: {capture.get('title', 'YouTube Live')}.\n"
-                "📋 الحالة: بانتظار اكتمال أول مقطع."
-            )
-
+            send_message(chat_id, f"📡 تم الاتصال بالبث: {capture.get('title', 'YouTube Live')}.")
             ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
             processed_files = set()
 
@@ -304,11 +301,8 @@ def process_youtube_live(url, chat_id):
                 if is_stopped(chat_id):
                     raise InterruptedError("تم إيقاف استقبال البث.")
 
-                segments = sorted(
-                    glob.glob(os.path.join(capture_dir, "live_*.ts"))
-                )
+                segments = sorted(glob.glob(os.path.join(capture_dir, "live_*.ts")))
                 capture_finished = capture_process.poll() is not None
-
                 ready_segments = segments if capture_finished else segments[:-1]
 
                 for segment_file in ready_segments:
@@ -318,30 +312,15 @@ def process_youtube_live(url, chat_id):
                         raise InterruptedError("تم إيقاف استقبال البث.")
 
                     processed_files.add(segment_file)
-                    segment_number = sent_count + 1
-                    output_file = os.path.join(
-                        folder, f"live_clip_{segment_number}.mp4"
-                    )
+                    sent_count += 1
+                    output_file = os.path.join(folder, f"live_clip_{sent_count}.mp4")
 
-                    send_message(
-                        chat_id,
-                        f"⚙️ اكتمل جزء جديد من البث. جاري تحويل المقطع {segment_number}.\n"
-                        f"✅ المقاطع المرسلة: {sent_count}."
-                    )
-
-                    convert_live_segment(
-                        chat_id, segment_file, output_file, ffmpeg
-                    )
+                    convert_live_segment(chat_id, segment_file, output_file, ffmpeg)
 
                     if is_stopped(chat_id):
                         raise InterruptedError("تم إيقاف استقبال البث.")
 
-                    send_document(
-                        chat_id,
-                        output_file,
-                        f"YouTube Live — المقطع {segment_number} — 720p"
-                    )
-                    sent_count += 1
+                    send_document(chat_id, output_file, f"YouTube Live — المقطع {sent_count} — 720p")
 
                     try:
                         os.remove(segment_file)
@@ -352,55 +331,27 @@ def process_youtube_live(url, chat_id):
                     except OSError:
                         pass
 
-                    send_message(
-                        chat_id,
-                        f"✅ تم إرسال المقطع {sent_count} من البث المباشر.\n"
-                        "📡 الحالة: استقبال البث مستمر وانتظار الجزء التالي."
-                    )
+                    gc.collect()
 
                 if capture_finished:
-                    remaining_segments = [
-                        path for path in segments if path not in processed_files
-                    ]
+                    remaining_segments = [path for path in segments if path not in processed_files]
                     if not remaining_segments:
                         break
 
                 time.sleep(LIVE_POLL_SECONDS)
 
-            if sent_count:
-                send_message(
-                    chat_id,
-                    f"🎉 انتهى استقبال البث وإرسال المقاطع.\n"
-                    f"إجمالي المقاطع المرسلة: {sent_count}."
-                )
-            else:
-                raise RuntimeError("انتهى البث دون العثور على مقاطع مكتملة.")
-
     except InterruptedError:
-        send_message(
-            chat_id,
-            f"⏹️ تم إيقاف استقبال البث.\nالمقاطع التي أُرسلت: {sent_count}."
-        )
+        send_message(chat_id, f"⏹️ تم إيقاف استقبال البث. المقاطع المرسلة: {sent_count}.")
     except Exception as exc:
         traceback.print_exc()
-        print(f"LIVE ERROR: {type(exc).__name__}: {exc}", flush=True)
-        if is_stopped(chat_id):
-            send_message(
-                chat_id,
-                f"⏹️ تم إيقاف استقبال البث.\nالمقاطع التي أُرسلت: {sent_count}."
-            )
-        else:
-            send_message(
-                chat_id,
-                f"❌ تعذر استقبال البث: {type(exc).__name__}: {exc}\n"
-                f"المقاطع التي أُرسلت: {sent_count}."
-            )
+        send_message(chat_id, f"❌ تعذر استقبال البث: {type(exc).__name__}: {exc}")
     finally:
         if capture_process is not None:
             try:
                 stop_live_capture(capture_process)
             except Exception:
                 traceback.print_exc()
+        gc.collect()
         with JOBS_LOCK:
             JOBS.pop(chat_id, None)
 
@@ -429,10 +380,8 @@ def start_pending_link(chat_id, link_id):
             "link_id": link_id
         }
 
-    send_message(chat_id, "▶️ بدأ العمل. يمكنك إيقافه من الزر أدناه.")
-    threading.Thread(
-        target=process_submitted_url, args=(url, chat_id), daemon=True
-    ).start()
+    send_message(chat_id, "▶️ بدأ العمل بالوضع الافتراضي (ملء الشاشة وتوسيط الشخصية).")
+    threading.Thread(target=process_submitted_url, args=(url, chat_id), daemon=True).start()
 
 
 def stop_chat_job(chat_id):
@@ -455,10 +404,16 @@ def stop_chat_job(chat_id):
 
 def make_control_keyboard(link_id):
     return {
-        "inline_keyboard": [[
-            {"text": "▶️ ابدأ العمل", "callback_data": f"start:{link_id}"},
-            {"text": "⏹ إيقاف العمل", "callback_data": f"stop:{link_id}"}
-        ]]
+        "inline_keyboard": [
+            [
+                {"text": "🖥️ ملء الشاشة (افتراضي)", "callback_data": f"mode:fullscreen:{link_id}"},
+                {"text": "🎥 وسط + Facecam", "callback_data": f"mode:facecam:{link_id}"}
+            ],
+            [
+                {"text": "▶️ ابدأ العمل", "callback_data": f"start:{link_id}"},
+                {"text": "⏹ إيقاف العمل", "callback_data": f"stop:{link_id}"}
+            ]
+        ]
     }
 
 
@@ -476,8 +431,30 @@ def webhook():
         callback_id = callback.get("id")
         callback_data = callback.get("data", "")
         chat_id = callback.get("message", {}).get("chat", {}).get("id")
+        message_id = callback.get("message", {}).get("message_id")
 
-        if callback_data.startswith("start:") and chat_id:
+        if callback_data.startswith("mode:") and chat_id:
+            parts = callback_data.split(":")
+            mode = parts[1]
+            link_id = parts[2]
+            USER_PREFERENCES[chat_id] = mode
+            
+            mode_names = {
+                "fullscreen": "ملء الشاشة وتوسيط الشخصية",
+                "facecam": "وسط + Facecam"
+            }
+            answer_callback_query(callback_id, f"تم اختيار: {mode_names.get(mode, mode)}")
+            
+            try:
+                requests.post(f"{API}/editMessageReplyMarkup", json={
+                    "chat_id": chat_id,
+                    "message_id": message_id,
+                    "reply_markup": make_control_keyboard(link_id)
+                }, timeout=10)
+            except Exception:
+                pass
+
+        elif callback_data.startswith("start:") and chat_id:
             answer_callback_query(callback_id, "بدء العمل")
             start_pending_link(chat_id, callback_data.split(":", 1)[1])
         elif callback_data.startswith("stop:") and chat_id:
@@ -503,23 +480,21 @@ def webhook():
     if text.startswith("/start"):
         send_message(
             chat_id,
-            "🎮 أهلاً بك في GTA 6 AI Clipper Bot!\n"
-            "أرسل رابط فيديو مسجل أو رابط YouTube Live، ثم اضغط زر ابدأ العمل.\n"
-            "مدة المقاطع: 60 ثانية (بدقة 720p لتلائم قيود الخادم)."
+            "🎮 أهلاً بك في بوت قص وفلترة فيديوهات الألعاب!\n"
+            "أرسل رابط فيديو أو بث مباشر، وسيتم تطبيق وضع ملء الشاشة وتوسيط الشخصية تلقائياً."
         )
     elif text.startswith(("http://", "https://")):
         link_id = uuid.uuid4().hex[:12]
         with pending_lock:
             pending_links[link_id] = text
 
-        if is_youtube_live_url(text):
-            description = "🔴 تم استلام رابط YouTube Live. استخدم الزرين للتحكم."
-        else:
-            description = "🎬 تم استلام رابط الفيديو. مدة كل مقطع 60 ثانية."
+        # تعيين الوضع الافتراضي للمستخدم تلقائياً عند إرسال الرابط
+        USER_PREFERENCES[chat_id] = "fullscreen"
 
         send_message(
             chat_id,
-            description,
+            "🎛️ تم استلام الرابط وتفعيل وضع (ملء الشاشة وتوسيط الشخصية) تلقائياً.\n"
+            "اضغط (ابدأ العمل) أو غير الوضع إذا أردت:",
             reply_markup=make_control_keyboard(link_id)
         )
     else:
@@ -531,4 +506,4 @@ def webhook():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
-    
+                                
