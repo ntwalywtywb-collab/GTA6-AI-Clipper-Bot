@@ -168,59 +168,8 @@ def download_ai_models():
 
 
 def analyze_video_with_ai(video_path):
-    try:
-        download_ai_models()
-        if not os.path.exists(PROTOTXT_PATH) or not os.path.exists(MODEL_PATH):
-            return "in_w*0.30"
-
-        net = cv2.dnn.readNetFromCaffe(PROTOTXT_PATH, MODEL_PATH)
-        cap = cv2.VideoCapture(video_path)
-        if not cap.isOpened():
-            return "in_w*0.30"
-
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-        if total_frames <= 0:
-            cap.release()
-            return "in_w*0.30"
-
-        step = max(1, total_frames // 8)
-        detected_x_coords = []
-
-        for i in range(0, total_frames, step):
-            cap.set(cv2.CAP_PROP_POS_FRAMES, i)
-            ret, frame = cap.read()
-            if not ret:
-                continue
-
-            h, w = frame.shape[:2]
-            blob = cv2.dnn.blobFromImage(cv2.resize(frame, (300, 300)), 0.007843, (300, 300), 127.5)
-            net.setInput(blob)
-            detections = net.forward()
-
-            for j in range(detections.shape[2]):
-                confidence = detections[0, 0, j, 2]
-                if confidence > 0.4:
-                    class_id = int(detections[0, 0, j, 1])
-                    if class_id == 1:
-                        box = detections[0, 0, j, 3:7] * np.array([w, h, w, h])
-                        startX, _, endX, _ = box.astype("int")
-                        center_x = (startX + endX) / 2.0
-                        detected_x_coords.append(center_x)
-                        break
-
-        cap.release()
-        gc.collect()
-
-        if detected_x_coords:
-            avg_x = sum(detected_x_coords) / len(detected_x_coords)
-            ratio = avg_x / w
-            ratio = max(0.15, min(0.45, ratio))
-            return f"in_w*{ratio:.2f}"
-
-    except Exception as e:
-        print(f"AI Analysis Error: {e}", flush=True)
-
-    return "in_w*0.30"
+    # تحليل سريع وخفيف جداً لتقليل وقت المعالجة
+    return "in_w*0.50"
 
 
 def get_ffmpeg_filter(chat_id, video_path=None):
@@ -229,13 +178,13 @@ def get_ffmpeg_filter(chat_id, video_path=None):
     if mode == "facecam":
         return "scale=810:1280:force_original_aspect_ratio=decrease,pad=810:1280:(ow-iw)/2:(oh-ih)/2,fps=30"
     else:
-        offset_expr = analyze_video_with_ai(video_path) if video_path else "in_w*0.30"
-        return f"scale=810:1280:force_original_aspect_ratio=increase,crop=810:1280:({offset_expr}-405):(in_h-1280)/2,fps=30"
+        # المقاس 810x1280 والتمركز في المنتصف تماماً (0.50)
+        return "scale=810:1280:force_original_aspect_ratio=increase,crop=810:1280:(in_w*0.50-405):(in_h-1280)/2,fps=30"
 
 
 def process_recorded_video(url, chat_id):
     try:
-        send_message(chat_id, "⏳ جاري التحميل والتحليل بالمقاس الأعرض الجديد وإزاحة 0.30...")
+        send_message(chat_id, "⏳ جاري التحميل والمعالجة السريعة (810x1280 - في المنتصف)...")
         with tempfile.TemporaryDirectory() as folder:
             ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
             output = os.path.join(folder, "source.%(ext)s")
@@ -287,14 +236,13 @@ def process_recorded_video(url, chat_id):
 
             filename = max(downloaded, key=os.path.getsize)
             
-            send_message(chat_id, "🧠 نموذج الذكاء الاصطناعي يحلل الإطارات...")
             vf_filter = get_ffmpeg_filter(chat_id, filename)
 
             duration = info.get("duration") or CLIP_LENGTH_SECONDS
             clip_count = min(10, max(1, int(
                 (duration + CLIP_LENGTH_SECONDS - 1) // CLIP_LENGTH_SECONDS
             )))
-            send_message(chat_id, f"🎬 اكتمل التحليل. إجمالي المقاطع: {clip_count}.")
+            send_message(chat_id, f"🎬 بدء تقطيع ومعالجة {clip_count} مقاطع بأقصى سرعة...")
 
             completed = 0
             for i in range(clip_count):
@@ -304,20 +252,21 @@ def process_recorded_video(url, chat_id):
                 start = i * CLIP_LENGTH_SECONDS
                 result = os.path.join(folder, f"clip_{i + 1}.mp4")
                 
+                # استخدام preset ultrafast لمضاعفة سرعة المعالجة وتقليل الوقت بشكل كبير
                 command = [
                     ffmpeg, "-y", "-ss", str(start), "-i", filename,
                     "-t", str(CLIP_LENGTH_SECONDS),
                     "-vf", vf_filter,
-                    "-c:v", "libx264", "-preset", "fast", "-crf", "22",
+                    "-c:v", "libx264", "-preset", "ultrafast", "-crf", "24",
                     "-threads", "2", "-pix_fmt", "yuv420p",
-                    "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", result
+                    "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", result
                 ]
                 run_ffmpeg(chat_id, command, timeout=RECORDED_CONVERT_TIMEOUT)
 
                 if is_stopped(chat_id):
                     raise InterruptedError("تم إيقاف العمل.")
 
-                send_document(chat_id, result, f"المقطع {i + 1} من {clip_count} — 810x1280 (0.30)")
+                send_document(chat_id, result, f"المقطع {i + 1} من {clip_count} — سريع (810x1280 سنتر)")
                 
                 try:
                     if os.path.exists(result):
@@ -328,7 +277,7 @@ def process_recorded_video(url, chat_id):
                 completed += 1
                 gc.collect()
 
-            send_message(chat_id, "🎉 انتهت معالجة جميع المقاطع بنجاح تام!")
+            send_message(chat_id, "🎉 انتهت المعالجة السريعة لجميع المقاطع بنجاح!")
 
     except InterruptedError:
         send_message(chat_id, "⏹️ تم إيقاف المعالجة.")
@@ -347,9 +296,9 @@ def convert_live_segment(chat_id, segment_file, output_file, ffmpeg):
         ffmpeg, "-y", "-i", segment_file,
         "-map", "0:v:0", "-map", "0:a?",
         "-vf", vf_filter,
-        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "24",
         "-threads", "2", "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-b:a", "192k",
+        "-c:a", "aac", "-b:a", "128k",
         "-movflags", "+faststart", output_file
     ]
     run_ffmpeg(chat_id, command, timeout=LIVE_CONVERT_TIMEOUT)
@@ -359,7 +308,7 @@ def process_youtube_live(url, chat_id):
     capture_process = None
     sent_count = 0
     try:
-        send_message(chat_id, "🔴 جاري الاتصال ببث YouTube Live بالمقاس الأعرض الجديد...")
+        send_message(chat_id, "🔴 جاري الاتصال ببث YouTube Live بالمعالجة السريعة...")
         with tempfile.TemporaryDirectory() as folder:
             capture_dir = os.path.join(folder, "live_segments")
             os.makedirs(capture_dir, exist_ok=True)
@@ -395,7 +344,7 @@ def process_youtube_live(url, chat_id):
                     if is_stopped(chat_id):
                         raise InterruptedError("تم إيقاف استقبال البث.")
 
-                    send_document(chat_id, output_file, f"YouTube Live — المقطع {sent_count}")
+                    send_document(chat_id, output_file, f"YouTube Live — المقطع السريع {sent_count}")
 
                     try:
                         os.remove(segment_file)
@@ -455,7 +404,7 @@ def start_pending_link(chat_id, link_id):
             "link_id": link_id
         }
 
-    send_message(chat_id, "▶️ بدأ العمل بالمقاس الأعرض الجديد وإزاحة 0.30.")
+    send_message(chat_id, "▶️ بدأ العمل بالمعالجة السريعة (810x1280 سنتر).")
     threading.Thread(target=process_submitted_url, args=(url, chat_id), daemon=True).start()
 
 
@@ -481,7 +430,7 @@ def make_control_keyboard(link_id):
     return {
         "inline_keyboard": [
             [
-                {"text": "🖥️ تتبع ذكي (أعرض 0.30)", "callback_data": f"mode:fullscreen:{link_id}"},
+                {"text": "⚡ معالجة سريعة (810x1280 سنتر)", "callback_data": f"mode:fullscreen:{link_id}"},
                 {"text": "🎥 وسط + Facecam", "callback_data": f"mode:facecam:{link_id}"}
             ],
             [
@@ -515,7 +464,7 @@ def webhook():
             USER_PREFERENCES[chat_id] = mode
             
             mode_names = {
-                "fullscreen": "التتبع الذكي (أعرض 0.30)",
+                "fullscreen": "المعالجة السريعة (810x1280 سنتر)",
                 "facecam": "وسط + Facecam"
             }
             answer_callback_query(callback_id, f"تم اختيار: {mode_names.get(mode, mode)}")
@@ -555,8 +504,8 @@ def webhook():
     if text.startswith("/start"):
         send_message(
             chat_id,
-            "🎮 أهلاً بك في بوت معالجة الفيديوهات!\n"
-            "أرسل رابط فيديو، وسيتم تطبيق المقاس الأعرض (810x1280) وإزاحة التمركز (0.30)."
+            "🎮 أهلاً بك في بوت معالجة الفيديوهات السريع!\n"
+            "أرسل رابط فيديو، وسيتم تطبيق المعالجة السريعة بمقاس 810x1280 والتمركز في المنتصف."
         )
     elif text.startswith(("http://", "https://")):
         link_id = uuid.uuid4().hex[:12]
@@ -567,7 +516,7 @@ def webhook():
 
         send_message(
             chat_id,
-            "🎛️ تم استلام الرابط وتفعيل وضع المقاس الأعرض (810x1280) مع إزاحة 0.30.\n"
+            "🎛️ تم استلام الرابط وتفعيل وضع المعالجة السريعة (810x1280 في المنتصف).\n"
             "اضغط (ابدأ العمل) للبدء:",
             reply_markup=make_control_keyboard(link_id)
         )
@@ -580,3 +529,4 @@ def webhook():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
+    
