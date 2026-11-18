@@ -1,27 +1,21 @@
 
 import os
 import subprocess
-import shutil
-import tempfile
-import traceback
-
 import yt_dlp
 import imageio_ffmpeg
 
 
 COOKIES_FILE = "/etc/secrets/m.youtube.com_cookies.txt"
-
 DENO_PATH = "/opt/render/project/src/.deno/bin/deno"
+
+SEGMENT_SECONDS = 60
 
 
 def get_live_stream(url):
-    """
-    استخراج رابط البث المباشر ومعلوماته.
-    يبدأ الالتقاط من اللحظة الحالية.
-    """
+    """استخراج رابط بث YouTube المباشر."""
 
     if "youtube.com" not in url and "youtu.be" not in url:
-        raise ValueError("هذا الملف مخصص لبثوث YouTube فقط")
+        raise ValueError("هذا الملف يدعم روابط YouTube فقط.")
 
     options = {
         "format": "best",
@@ -36,9 +30,7 @@ def get_live_stream(url):
 
     if os.path.isfile(DENO_PATH):
         options["js_runtimes"] = {
-            "deno": {
-                "path": DENO_PATH
-            }
+            "deno": {"path": DENO_PATH}
         }
         options["remote_components"] = ["ejs:github"]
 
@@ -46,45 +38,29 @@ def get_live_stream(url):
         options["cookiefile"] = COOKIES_FILE
 
     with yt_dlp.YoutubeDL(options) as ydl:
-        info = ydl.extract_info(
-            url,
-            download=False
-        )
+        info = ydl.extract_info(url, download=False)
 
     if info.get("live_status") != "is_live":
-        raise Exception(
-            "الرابط ليس بثاً مباشراً نشطاً حالياً"
-        )
+        raise RuntimeError("الرابط ليس بثاً مباشراً نشطاً.")
 
     stream_url = info.get("url")
 
     if not stream_url:
-        raise Exception(
-            "تعذر استخراج رابط البث"
-        )
+        raise RuntimeError("تعذر استخراج رابط البث.")
 
     return {
         "url": stream_url,
-        "title": info.get("title", "YouTube Live"),
-        "headers": info.get("http_headers", {}),
-        "status": info.get("live_status")
+        "title": info.get("title") or "YouTube Live",
+        "headers": info.get("http_headers") or {},
     }
 
 
-def start_live_capture(
-    url,
-    output_dir,
-    segment_seconds=30
-):
+def start_live_capture(url, output_dir):
     """
-    بدء التقاط البث وتقسيمه إلى ملفات
-    قصيرة مدة كل منها 30 ثانية.
+    بدء التقاط البث وتقسيمه إلى أجزاء مدة كل منها 60 ثانية.
     """
 
-    os.makedirs(
-        output_dir,
-        exist_ok=True
-    )
+    os.makedirs(output_dir, exist_ok=True)
 
     ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
 
@@ -105,7 +81,7 @@ def start_live_capture(
     command = [
         ffmpeg,
         "-hide_banner",
-        "-loglevel", "warning"
+        "-loglevel", "warning",
     ]
 
     if header_text:
@@ -120,41 +96,39 @@ def start_live_capture(
         "-map", "0:a?",
         "-c", "copy",
         "-f", "segment",
-        "-segment_time", str(segment_seconds),
+        "-segment_time", str(SEGMENT_SECONDS),
         "-reset_timestamps", "1",
         "-segment_format", "mpegts",
-        output_pattern
+        output_pattern,
     ])
 
     process = subprocess.Popen(
         command,
         stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL
+        stderr=subprocess.DEVNULL,
     )
 
     return {
         "process": process,
         "output_pattern": output_pattern,
         "title": live["title"],
-        "segment_seconds": segment_seconds
+        "segment_seconds": SEGMENT_SECONDS,
     }
 
 
 def stop_live_capture(process):
-    """
-    إيقاف التقاط البث.
-    """
+    """إيقاف التقاط البث."""
 
-    if process and process.poll() is None:
-        process.terminate()
+    if process is None or process.poll() is not None:
+        return False
 
-        try:
-            process.wait(timeout=10)
+    process.terminate()
 
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait()
+    try:
+        process.wait(timeout=10)
 
-        return True
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
 
-    return False
+    return True
