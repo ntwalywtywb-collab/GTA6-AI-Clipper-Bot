@@ -8,6 +8,8 @@ import imageio_ffmpeg
 import yt_dlp
 
 from bot_core import *
+from bot_highlights import BEST_CLIP_COUNT, pick_best_windows
+from bot_layout import build_vertical_command
 
 
 def process_recorded_video(url, chat_id):
@@ -63,10 +65,12 @@ def process_recorded_video(url, chat_id):
                 raise RuntimeError("Downloaded video file not found")
 
             filename = max(downloaded, key=os.path.getsize)
-            duration = info.get("duration") or CLIP_LENGTH_SECONDS
-            clip_count = min(10, max(1, int(
-                (duration + CLIP_LENGTH_SECONDS - 1) // CLIP_LENGTH_SECONDS
-            )))
+            send_message(chat_id, "\U0001f50e \u062c\u0627\u0631\u064a \u062a\u062d\u0644\u064a\u0644 \u0627\u0644\u0641\u064a\u062f\u064a\u0648 \u0644\u0627\u062e\u062a\u064a\u0627\u0631 \u0623\u0641\u0636\u0644 \u0627\u0644\u0644\u062d\u0638\u0627\u062a...")
+            windows = pick_best_windows(
+                ffmpeg, filename, info, CLIP_LENGTH_SECONDS, BEST_CLIP_COUNT,
+                should_stop=lambda: is_stopped(chat_id)
+            )
+            clip_count = len(windows)
             send_message(
                 chat_id,
                 f"\U0001f3ac \u0627\u0643\u062a\u0645\u0644 \u0627\u0644\u062a\u062d\u0645\u064a\u0644. \u0625\u062c\u0645\u0627\u0644\u064a \u0627\u0644\u0645\u0642\u0627\u0637\u0639: {clip_count}.\n"
@@ -85,17 +89,12 @@ def process_recorded_video(url, chat_id):
                     f"\U0001f4cb \u0627\u0644\u0645\u0642\u0627\u0637\u0639 \u0627\u0644\u0645\u0643\u062a\u0645\u0644\u0629: {completed} \u2014 \u0627\u0644\u0645\u062a\u0628\u0642\u064a\u0629: {remaining_before}."
                 )
 
-                start = i * CLIP_LENGTH_SECONDS
+                start = windows[i]
                 result = os.path.join(folder, f"clip_{i + 1}.mp4")
-                command = [
-                    ffmpeg, "-y", "-ss", str(start), "-i", filename,
-                    "-t", str(CLIP_LENGTH_SECONDS),
-                    "-vf",
-                    "scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280,fps=30",
-                    "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
-                    "-threads", "2", "-pix_fmt", "yuv420p",
-                    "-c:a", "aac", "-movflags", "+faststart", result
-                ]
+                command = build_vertical_command(
+                    ffmpeg, filename, result,
+                    start=start, duration=CLIP_LENGTH_SECONDS, crf=28
+                )
                 run_ffmpeg(chat_id, command, timeout=RECORDED_CONVERT_TIMEOUT)
 
                 if is_stopped(chat_id):
@@ -123,3 +122,4 @@ def process_recorded_video(url, chat_id):
     finally:
         with JOBS_LOCK:
             JOBS.pop(chat_id, None)
+            
