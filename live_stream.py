@@ -263,9 +263,7 @@ def start_live_capture(url: str, output_dir: str, segment_seconds: int = 60) -> 
     process = subprocess.Popen(
         command,
         stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-        text=True,
-        bufsize=1,
+        stderr=subprocess.DEVNULL,  # an unread PIPE can fill up and freeze ffmpeg
     )
 
     return {
