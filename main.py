@@ -38,7 +38,6 @@ pending_lock = threading.Lock()
 JOBS = {}
 JOBS_LOCK = threading.Lock()
 
-# جعل وضع "ملء الشاشة مع توسيط الشخصية" هو الافتراضي تلقائياً
 USER_PREFERENCES = {}
 
 
@@ -149,21 +148,18 @@ def run_ffmpeg(chat_id, command, timeout=900):
 
 
 def get_ffmpeg_filter(chat_id):
-    """الوضع الافتراضي: ملء الشاشة العمودية مع توسيط الشخصية تلقائياً"""
     mode = USER_PREFERENCES.get(chat_id, "fullscreen")
     
     if mode == "facecam":
         return "scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2,fps=30"
-    elif mode == "tracking":
-        return "crop=ih*9/16:ih:(iw-ih*9/16)/2:0,scale=720:1280,fps=30"
     else:
-        # الوضع الافتراضي التلقائي: ملء الشاشة العمودية بقياس تيك توك وتوسيط المحتوى
-        return "scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280,fps=30"
+        # الحفاظ على إزاحة 0.25 لتوسيط الشخصية المائلة للليسار بدقة عالية
+        return "scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280:(in_w-720)*0.25:(in_h-1280)/2,fps=30"
 
 
 def process_recorded_video(url, chat_id):
     try:
-        send_message(chat_id, "⏳ بدأت معالجة الفيديو المسجل وتوسيط الشخصية تلقائياً (720p)...")
+        send_message(chat_id, "⏳ بدأت معالجة الفيديو المسجل بجودة عالية وتوسيط دقيق...")
         with tempfile.TemporaryDirectory() as folder:
             ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
             output = os.path.join(folder, "source.%(ext)s")
@@ -229,20 +225,21 @@ def process_recorded_video(url, chat_id):
                 result = os.path.join(folder, f"clip_{i + 1}.mp4")
                 
                 vf_filter = get_ffmpeg_filter(chat_id)
+                # رفع الجودة عبر ضبط crf إلى 22 و preset إلى fast
                 command = [
                     ffmpeg, "-y", "-ss", str(start), "-i", filename,
                     "-t", str(CLIP_LENGTH_SECONDS),
                     "-vf", vf_filter,
-                    "-c:v", "libx264", "-preset", "veryfast", "-crf", "26",
+                    "-c:v", "libx264", "-preset", "fast", "-crf", "22",
                     "-threads", "2", "-pix_fmt", "yuv420p",
-                    "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", result
+                    "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", result
                 ]
                 run_ffmpeg(chat_id, command, timeout=RECORDED_CONVERT_TIMEOUT)
 
                 if is_stopped(chat_id):
                     raise InterruptedError("تم إيقاف العمل.")
 
-                send_document(chat_id, result, f"المقطع {i + 1} من {clip_count} — 720p")
+                send_document(chat_id, result, f"المقطع {i + 1} من {clip_count} — 720p عالي الجودة")
                 
                 try:
                     if os.path.exists(result):
@@ -253,7 +250,7 @@ def process_recorded_video(url, chat_id):
                 completed += 1
                 gc.collect()
 
-            send_message(chat_id, "🎉 انتهت معالجة جميع المقاطع بنجاح!")
+            send_message(chat_id, "🎉 انتهت معالجة جميع المقاطع بدقة عالية!")
 
     except InterruptedError:
         send_message(chat_id, "⏹️ تم إيقاف المعالجة.")
@@ -272,9 +269,9 @@ def convert_live_segment(chat_id, segment_file, output_file, ffmpeg):
         ffmpeg, "-y", "-i", segment_file,
         "-map", "0:v:0", "-map", "0:a?",
         "-vf", vf_filter,
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "28",
+        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
         "-threads", "2", "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-b:a", "128k",
+        "-c:a", "aac", "-b:a", "192k",
         "-movflags", "+faststart", output_file
     ]
     run_ffmpeg(chat_id, command, timeout=LIVE_CONVERT_TIMEOUT)
@@ -284,7 +281,7 @@ def process_youtube_live(url, chat_id):
     capture_process = None
     sent_count = 0
     try:
-        send_message(chat_id, "🔴 جاري الاتصال ببث YouTube Live وتوسيط الشخصية تلقائياً...")
+        send_message(chat_id, "🔴 جاري الاتصال ببث YouTube Live بجودة عالية...")
         with tempfile.TemporaryDirectory() as folder:
             capture_dir = os.path.join(folder, "live_segments")
             os.makedirs(capture_dir, exist_ok=True)
@@ -380,7 +377,7 @@ def start_pending_link(chat_id, link_id):
             "link_id": link_id
         }
 
-    send_message(chat_id, "▶️ بدأ العمل بالوضع الافتراضي (ملء الشاشة وتوسيط الشخصية).")
+    send_message(chat_id, "▶️ بدأ العمل بالوضع المحسن (جودة عالية وتوسيط الشخصية).")
     threading.Thread(target=process_submitted_url, args=(url, chat_id), daemon=True).start()
 
 
@@ -481,20 +478,19 @@ def webhook():
         send_message(
             chat_id,
             "🎮 أهلاً بك في بوت قص وفلترة فيديوهات الألعاب!\n"
-            "أرسل رابط فيديو أو بث مباشر، وسيتم تطبيق وضع ملء الشاشة وتوسيط الشخصية تلقائياً."
+            "أرسل رابط فيديو أو بث مباشر، وسيتم ضبط الجودة العالية والتمركز تلقائياً."
         )
     elif text.startswith(("http://", "https://")):
         link_id = uuid.uuid4().hex[:12]
         with pending_lock:
             pending_links[link_id] = text
 
-        # تعيين الوضع الافتراضي للمستخدم تلقائياً عند إرسال الرابط
         USER_PREFERENCES[chat_id] = "fullscreen"
 
         send_message(
             chat_id,
-            "🎛️ تم استلام الرابط وتفعيل وضع (ملء الشاشة وتوسيط الشخصية) تلقائياً.\n"
-            "اضغط (ابدأ العمل) أو غير الوضع إذا أردت:",
+            "🎛️ تم استلام الرابط وتفعيل وضع الجودة العالية مع توسيط الشخصية.\n"
+            "اضغط (ابدأ العمل) للبدء:",
             reply_markup=make_control_keyboard(link_id)
         )
     else:
