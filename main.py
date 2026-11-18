@@ -26,7 +26,11 @@ DENO_PATH = "/opt/render/project/src/.deno/bin/deno"
 
 CLIP_LENGTH_SECONDS = 60
 LIVE_SEGMENT_SECONDS = 60
-LIVE_TEST_TIMEOUT = 240
+LIVE_TEST_TIMEOUT = 300
+
+# Increased processing limits for Render's low-CPU instances.
+LIVE_CONVERT_TIMEOUT = 900
+RECORDED_CONVERT_TIMEOUT = 1200
 
 pending_links = {}
 pending_lock = threading.Lock()
@@ -69,7 +73,7 @@ def send_video(chat_id, filename, caption=None):
             f"{API}/sendVideo",
             data={"chat_id": chat_id, "caption": caption or ""},
             files={"video": video},
-            timeout=300
+            timeout=(30, 600)
         )
     response.raise_for_status()
     result = response.json()
@@ -100,29 +104,42 @@ def register_process(chat_id, process):
         process.terminate()
 
 
-def run_ffmpeg(chat_id, command, timeout=600):
-    process = subprocess.Popen(
-        command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True
-    )
-    register_process(chat_id, process)
-    deadline = time.monotonic() + timeout
-    while process.poll() is None:
-        if is_stopped(chat_id):
-            process.terminate()
-            try:
-                process.wait(timeout=8)
-            except subprocess.TimeoutExpired:
+def run_ffmpeg(chat_id, command, timeout=900):
+    # Use a temporary file instead of PIPE so FFmpeg cannot block if stderr fills.
+    with tempfile.TemporaryFile(mode="w+b") as error_file:
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.DEVNULL,
+            stderr=error_file
+        )
+        register_process(chat_id, process)
+        deadline = time.monotonic() + timeout
+
+        while process.poll() is None:
+            if is_stopped(chat_id):
+                process.terminate()
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+                raise InterruptedError("تم إيقاف العمل بطلب المستخدم.")
+
+            if time.monotonic() > deadline:
                 process.kill()
                 process.wait()
-            raise InterruptedError("تم إيقاف العمل بطلب المستخدم.")
-        if time.monotonic() > deadline:
-            process.kill()
-            process.wait()
-            raise TimeoutError("انتهت مهلة معالجة الفيديو.")
-        time.sleep(0.5)
-    if process.returncode != 0:
-        error = process.stderr.read()[-3000:] if process.stderr else ""
-        raise RuntimeError(f"FFmpeg failed: {error}")
+                error_file.seek(0)
+                details = error_file.read().decode("utf-8", errors="replace")[-2500:]
+                raise TimeoutError(
+                    f"انتهت مهلة معالجة الفيديو بعد {timeout} ثانية. "
+                    f"تفاصيل FFmpeg: {details}"
+                )
+            time.sleep(0.5)
+
+        if process.returncode != 0:
+            error_file.seek(0)
+            details = error_file.read().decode("utf-8", errors="replace")[-3000:]
+            raise RuntimeError(f"FFmpeg failed (code {process.returncode}): {details}")
 
 
 def process_recorded_video(url, chat_id):
@@ -195,9 +212,9 @@ def process_recorded_video(url, chat_id):
                     "-vf",
                     "scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280",
                     "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
-                    "-c:a", "aac", "-movflags", "+faststart", result
+                    "-threads", "2", "-c:a", "aac", "-movflags", "+faststart", result
                 ]
-                run_ffmpeg(chat_id, command, timeout=600)
+                run_ffmpeg(chat_id, command, timeout=RECORDED_CONVERT_TIMEOUT)
                 if is_stopped(chat_id):
                     raise InterruptedError("تم إيقاف العمل.")
                 send_video(chat_id, result, f"المقطع {i + 1} من {clip_count} — 60 ثانية")
@@ -212,7 +229,7 @@ def process_recorded_video(url, chat_id):
         if is_stopped(chat_id):
             send_message(chat_id, "⏹️ تم إيقاف المعالجة.")
         else:
-            send_message(chat_id, "❌ فشلت معالجة الفيديو المسجل. راجع سجلات Render.")
+            send_message(chat_id, f"❌ فشلت معالجة الفيديو المسجل: {type(exc).__name__}: {exc}")
     finally:
         with JOBS_LOCK:
             JOBS.pop(chat_id, None)
@@ -225,9 +242,10 @@ def convert_live_segment(chat_id, segment_file, output_file, ffmpeg):
         "-vf",
         "scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2",
         "-c:v", "libx264", "-preset", "ultrafast", "-crf", "30",
-        "-c:a", "aac", "-b:a", "96k", "-movflags", "+faststart", output_file
+        "-threads", "2", "-c:a", "aac", "-b:a", "96k",
+        "-movflags", "+faststart", output_file
     ]
-    run_ffmpeg(chat_id, command, timeout=300)
+    run_ffmpeg(chat_id, command, timeout=LIVE_CONVERT_TIMEOUT)
 
 
 def process_youtube_live_test(url, chat_id):
@@ -270,6 +288,153 @@ def process_youtube_live_test(url, chat_id):
             output = os.path.join(folder, "live_clip_60_seconds.mp4")
             send_message(chat_id, "✅ وصل الجزء الأول. جاري تحويله وإرساله...")
             convert_live_segment(chat_id, selected, output, ffmpeg)
+            if is_stopped(chat_id):
+                raise InterruptedError("تم إيقاف العمل.")
+            send_video(chat_id, output, "YouTube Live — مقطع نحو 60 ثانية")
+            send_message(
+                chat_id,
+                "🎉 نجح اختبار استقبال البث وإرسال أول مقطع مدته نحو 60 ثانية.\n"
+                "ملاحظة: هذه نسخة اختبار تلتقط مقطعاً واحداً فقط؛ التشغيل المستمر "
+                "واستخراج أفضل اللحظات بالذكاء الاصطناعي لم يضافا بعد."
+            )
+    except InterruptedError:
+        send_message(chat_id, "⏹️ تم إيقاف استقبال البث.")
+    except Exception as exc:
+        traceback.print_exc()
+        print(f"LIVE ERROR: {type(exc).__name__}: {exc}", flush=True)
+        if is_stopped(chat_id):
+            send_message(chat_id, "⏹️ تم إيقاف استقبال البث.")
+        else:
+            send_message(chat_id, f"❌ تعذر استقبال البث: {type(exc).__name__}: {exc}")
+    finally:
+        if capture_process is not None:
+            try:
+                stop_live_capture(capture_process)
+            except Exception:
+                traceback.print_exc()
+        with JOBS_LOCK:
+            JOBS.pop(chat_id, None)
+
+
+def process_submitted_url(url, chat_id):
+    if is_youtube_live_url(url):
+        process_youtube_live_test(url, chat_id)
+    else:
+        process_recorded_video(url, chat_id)
+
+
+def start_pending_link(chat_id, link_id):
+    with pending_lock:
+        url = pending_links.pop(link_id, None)
+    if not url:
+        send_message(chat_id, "انتهت صلاحية الرابط أو تم تشغيله مسبقاً.")
+        return
+
+    with JOBS_LOCK:
+        if chat_id in JOBS:
+            send_message(chat_id, "⚠️ يوجد عمل جارٍ بالفعل. أوقفه أولاً.")
+            return
+        JOBS[chat_id] = {
+            "stop_event": threading.Event(),
+            "process": None,
+            "link_id": link_id
+        }
+
+    send_message(chat_id, "▶️ بدأ العمل. يمكنك إيقافه من الزر أدناه.")
+    threading.Thread(
+        target=process_submitted_url, args=(url, chat_id), daemon=True
+    ).start()
+
+
+def stop_chat_job(chat_id):
+    with JOBS_LOCK:
+        job = JOBS.get(chat_id)
+        if not job:
+            return False, None
+        job["stop_event"].set()
+        process = job.get("process")
+    if process is not None:
+        try:
+            if process.poll() is None:
+                process.terminate()
+        except Exception as exc:
+            print(f"Stop process error: {exc}", flush=True)
+    return True, process
+
+
+def make_control_keyboard(link_id):
+    return {
+        "inline_keyboard": [[
+            {"text": "▶️ ابدأ العمل", "callback_data": f"start:{link_id}"},
+            {"text": "⏹ إيقاف العمل", "callback_data": f"stop:{link_id}"}
+        ]]
+    }
+
+
+@app.route("/", methods=["GET"])
+def home():
+    return "GTA 6 AI Clipper Bot is running!"
+
+
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    data = request.get_json(silent=True) or {}
+    callback = data.get("callback_query")
+
+    if callback:
+        callback_id = callback.get("id")
+        callback_data = callback.get("data", "")
+        chat_id = callback.get("message", {}).get("chat", {}).get("id")
+        if callback_data.startswith("start:") and chat_id:
+            answer_callback_query(callback_id, "بدء العمل")
+            start_pending_link(chat_id, callback_data.split(":", 1)[1])
+        elif callback_data.startswith("stop:") and chat_id:
+            answer_callback_query(callback_id, "تم إرسال طلب الإيقاف")
+            stopped, _ = stop_chat_job(chat_id)
+            send_message(
+                chat_id,
+                "⏹️ تم إرسال طلب إيقاف العمل." if stopped
+                else "لا يوجد عمل جارٍ لإيقافه."
+            )
+        else:
+            answer_callback_query(callback_id, "طلب غير معروف")
+        return "OK", 200
+
+    message = data.get("message", {})
+    chat_id = message.get("chat", {}).get("id")
+    text = message.get("text", "").strip()
+    if not chat_id or not text:
+        return "OK", 200
+
+    if text.startswith("/start"):
+        send_message(
+            chat_id,
+            "🎮 أهلاً بك في GTA 6 AI Clipper Bot!\n"
+            "أرسل رابط فيديو مسجل أو رابط YouTube Live، ثم اضغط زر ابدأ العمل.\n"
+            "مدة المقاطع: 60 ثانية."
+        )
+    elif text.startswith(("http://", "https://")):
+        link_id = uuid.uuid4().hex[:12]
+        with pending_lock:
+            pending_links[link_id] = text
+        if is_youtube_live_url(text):
+            description = "🔴 تم استلام رابط YouTube Live. استخدم الزرين للتحكم."
+        else:
+            description = "🎬 تم استلام رابط الفيديو. مدة كل مقطع 60 ثانية."
+        send_message(
+            chat_id, description,
+            reply_markup=make_control_keyboard(link_id)
+        )
+    else:
+        send_message(chat_id, "أرسل رابط فيديو أو رابط YouTube Live أولاً.")
+
+    return "OK", 200
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
+ut, ffmpeg)
             if is_stopped(chat_id):
                 raise InterruptedError("تم إيقاف العمل.")
             send_video(chat_id, output, "YouTube Live — مقطع نحو 60 ثانية")
