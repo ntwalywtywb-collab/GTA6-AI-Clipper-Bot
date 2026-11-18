@@ -7,13 +7,9 @@ import shutil
 import traceback
 import time
 import uuid
-import re
-import math
 import requests
 import yt_dlp
 import imageio_ffmpeg
-import cv2
-import numpy as np
 
 from flask import Flask, request
 from live_stream import start_live_capture, stop_live_capture
@@ -29,11 +25,10 @@ COOKIES_FILE = "/etc/secrets/m.youtube.com_cookies.txt"
 DENO_PATH = "/opt/render/project/src/.deno/bin/deno"
 
 CLIP_LENGTH_SECONDS = 60
-LIVE_SEGMENT_SECONDS = 180
+LIVE_SEGMENT_SECONDS = 60
 LIVE_CONVERT_TIMEOUT = 900
 RECORDED_CONVERT_TIMEOUT = 1200
 LIVE_POLL_SECONDS = 1
-ANALYSIS_SAMPLE_SECONDS = 3
 
 pending_links = {}
 pending_lock = threading.Lock()
@@ -71,12 +66,14 @@ def answer_callback_query(callback_id, message=None):
 
 
 def send_document(chat_id, filename, caption=None):
+    # Upload as a document so Telegram preserves the converted MP4 file
+    # instead of processing it as a playable video message.
     with open(filename, "rb") as document:
         response = requests.post(
             f"{API}/sendDocument",
             data={"chat_id": chat_id, "caption": caption or ""},
             files={"document": (os.path.basename(filename), document, "application/octet-stream")},
-            timeout=(30, 600),
+            timeout=(30, 600)
         )
     response.raise_for_status()
     result = response.json()
@@ -108,10 +105,16 @@ def register_process(chat_id, process):
 
 
 def run_ffmpeg(chat_id, command, timeout=900):
+    # A temporary file prevents FFmpeg from blocking on a full stderr PIPE.
     with tempfile.TemporaryFile(mode="w+b") as error_file:
-        process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=error_file)
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.DEVNULL,
+            stderr=error_file
+        )
         register_process(chat_id, process)
         deadline = time.monotonic() + timeout
+
         while process.poll() is None:
             if is_stopped(chat_id):
                 process.terminate()
@@ -121,301 +124,415 @@ def run_ffmpeg(chat_id, command, timeout=900):
                     process.kill()
                     process.wait()
                 raise InterruptedError("تم إيقاف العمل بطلب المستخدم.")
+
             if time.monotonic() > deadline:
                 process.kill()
                 process.wait()
                 error_file.seek(0)
                 details = error_file.read().decode("utf-8", errors="replace")[-2500:]
-                raise TimeoutError(f"انتهت مهلة معالجة الفيديو بعد {timeout} ثانية. تفاصيل FFmpeg: {details}")
+                raise TimeoutError(
+                    f"انتهت مهلة معالجة الفيديو بعد {timeout} ثانية. "
+                    f"تفاصيل FFmpeg: {details}"
+                )
             time.sleep(0.5)
+
         if process.returncode != 0:
             error_file.seek(0)
             details = error_file.read().decode("utf-8", errors="replace")[-3000:]
             raise RuntimeError(f"FFmpeg failed (code {process.returncode}): {details}")
 
 
-def probe_duration(filename, ffmpeg):
-    # ffprobe is shipped beside imageio-ffmpeg's binary on supported builds.
-    ffprobe = os.path.join(os.path.dirname(ffmpeg), "ffprobe")
-    if not os.path.isfile(ffprobe):
-        ffprobe = "ffprobe"
-    command = [ffprobe, "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", filename]
-    try:
-        result = subprocess.run(command, capture_output=True, text=True, timeout=30)
-        if result.returncode == 0:
-            value = float(result.stdout.strip())
-            if value > 0:
-                return value
-    except Exception:
-        pass
-    # OpenCV fallback: Render may not provide a separate ffprobe executable.
-    cap = cv2.VideoCapture(filename)
-    if cap.isOpened():
-        frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        cap.release()
-        if frames > 0 and fps > 0:
-            return float(frames / fps)
-    return 0.0
-
-
-def _sample_video_metrics(filename, start_seconds, ffmpeg, chat_id):
-    cap = cv2.VideoCapture(filename)
-    if not cap.isOpened():
-        raise RuntimeError("تعذر فتح الفيديو لتحليل الحركة.")
-    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
-    previous = None
-    motion_values = []
-    face_positions = []
-    face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
-    if face_cascade.empty():
-        cap.release()
-        raise RuntimeError("تعذر تحميل نموذج اكتشاف الوجه من OpenCV.")
-    for offset in range(0, CLIP_LENGTH_SECONDS, ANALYSIS_SAMPLE_SECONDS):
-        if is_stopped(chat_id):
-            cap.release()
-            raise InterruptedError("تم إيقاف التحليل.")
-        timestamp = max(0.0, start_seconds + offset)
-        cap.set(cv2.CAP_PROP_POS_MSEC, timestamp * 1000.0)
-        ok, frame = cap.read()
-        if not ok or frame is None:
-            continue
-        small = cv2.resize(frame, (320, 180), interpolation=cv2.INTER_AREA)
-        gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
-        if previous is not None:
-            motion_values.append(float(np.mean(cv2.absdiff(gray, previous))))
-        previous = gray
-        gray_full = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        faces = face_cascade.detectMultiScale(gray_full, scaleFactor=1.1, minNeighbors=5, minSize=(max(24, width // 35), max(24, height // 35)))
-        for (x, y, w, h) in faces:
-            # Discard implausibly tiny detections; retain coordinates in source pixels.
-            if w >= max(24, width * 0.025) and h >= max(24, height * 0.025):
-                face_positions.append((int(x), int(y), int(w), int(h)))
-    cap.release()
-    motion_score = float(np.mean(motion_values)) if motion_values else 0.0
-    return motion_score, face_positions, width, height
-
-
-
-
-def _audio_score(filename, start_seconds, ffmpeg):
-    command = [ffmpeg, "-hide_banner", "-ss", str(start_seconds), "-t", str(CLIP_LENGTH_SECONDS), "-i", filename, "-vn", "-af", "volumedetect", "-f", "null", "-"]
-    try:
-        result = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, timeout=90)
-        match = re.search(r"mean_volume:\s*(-?\d+(?:\.\d+)?)\s*dB", result.stderr or "")
-        if match:
-            return max(-60.0, min(0.0, float(match.group(1)))) + 60.0
-    except Exception as exc:
-        print(f"[analysis] audio score unavailable: {exc}", flush=True)
-    return 0.0
-
-
-def _facecam_crop(face_positions, frame_width, frame_height):
-    """Infer a stable face-camera region from repeated face detections."""
-    if len(face_positions) < 5 or frame_width <= 0 or frame_height <= 0:
-        return None
-    centers = np.array([[x + w / 2.0, y + h / 2.0] for x, y, w, h in face_positions], dtype=np.float32)
-    median_center = np.median(centers, axis=0)
-    distances = np.sqrt(np.sum((centers - median_center) ** 2, axis=1))
-    stable = [face_positions[i] for i, distance in enumerate(distances) if distance < max(frame_width, frame_height) * 0.16]
-    if len(stable) < 5 or len(stable) / len(face_positions) < 0.45:
-        return None
-    widths = [f[2] for f in stable]
-    heights = [f[3] for f in stable]
-    fw = float(np.median(widths))
-    fh = float(np.median(heights))
-    cx, cy = np.median([[x + w / 2.0, y + h / 2.0] for x, y, w, h in stable], axis=0)
-    # Approximate a webcam tile around the face, with extra room for shoulders.
-    crop_w = int(max(fw * 3.4, fh * 2.8))
-    crop_h = int(crop_w * 9 / 16)
-    crop_h = max(crop_h, int(fh * 3.2))
-    crop_w = int(crop_h * 16 / 9)
-    crop_w = min(crop_w, frame_width)
-    crop_h = min(crop_h, frame_height)
-    x = int(cx - crop_w / 2)
-    y = int(cy - crop_h * 0.43)
-    x = max(0, min(frame_width - crop_w, x))
-    y = max(0, min(frame_height - crop_h, y))
-    if crop_w < 80 or crop_h < 60:
-        return None
-    return x, y, crop_w, crop_h
-
-
-def analyze_best_window(filename, chat_id, ffmpeg, window_seconds=180, source_offset=0):
-    """Score 60-second windows within a source chunk and return best offset and face crop."""
-    duration = probe_duration(filename, ffmpeg)
-    if duration <= 0:
-        duration = float(window_seconds)
-    available_duration = max(0.0, duration - source_offset)
-    offsets = [float(v) for v in range(0, max(1, int(available_duration - CLIP_LENGTH_SECONDS) + 1), CLIP_LENGTH_SECONDS)]
-    if not offsets:
-        raise RuntimeError("المقطع المستلم أقصر من 60 ثانية، لا يمكن استخراج مقطع كامل.")
-    candidates = []
-    for offset in offsets:
-        if is_stopped(chat_id):
-            raise InterruptedError("تم إيقاف تحليل أفضل اللحظات.")
-        motion, faces, width, height = _sample_video_metrics(filename, source_offset + offset, ffmpeg, chat_id)
-        audio = _audio_score(filename, offset, ffmpeg)
-        candidates.append({"offset": offset, "motion": motion, "audio": audio, "faces": faces, "width": width, "height": height})
-        print(f"[analysis] offset={offset:.0f}s motion={motion:.2f} audio={audio:.2f}", flush=True)
-    motion_values = np.array([c["motion"] for c in candidates], dtype=np.float32)
-    audio_values = np.array([c["audio"] for c in candidates], dtype=np.float32)
-    motion_range = float(np.ptp(motion_values))
-    audio_range = float(np.ptp(audio_values))
-    for c in candidates:
-        motion_norm = (c["motion"] - float(np.min(motion_values))) / motion_range if motion_range > 1e-6 else 0.5
-        audio_norm = (c["audio"] - float(np.min(audio_values))) / audio_range if audio_range > 1e-6 else 0.5
-        c["score"] = 0.55 * motion_norm + 0.45 * audio_norm
-    best = max(candidates, key=lambda c: c["score"])
-    face_crop = _facecam_crop(best["faces"], best["width"], best["height"])
-    return best["offset"], face_crop, best["score"]
-
-
-def export_highlight(chat_id, source_file, output_file, ffmpeg, source_offset=0):
-    offset, face_crop, score = analyze_best_window(source_file, chat_id, ffmpeg, LIVE_SEGMENT_SECONDS, source_offset)
-    seek = source_offset + offset
-    if face_crop:
-        x, y, w, h = face_crop
-        filter_complex = (
-            f"[0:v]split=2[game][face];"
-            f"[game]scale=720:875:force_original_aspect_ratio=increase,crop=720:875[gb];"
-            f"[face]crop={w}:{h}:{x}:{y},scale=720:405[fc];"
-            f"[fc][gb]vstack=inputs=2,fps=30[outv]"
-        )
-        command = [ffmpeg, "-y", "-ss", str(seek), "-i", source_file, "-t", str(CLIP_LENGTH_SECONDS), "-filter_complex", filter_complex, "-map", "[outv]", "-map", "0:a?", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "29", "-threads", "2", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "96k", "-movflags", "+faststart", output_file]
-    else:
-        command = [ffmpeg, "-y", "-ss", str(seek), "-i", source_file, "-t", str(CLIP_LENGTH_SECONDS), "-vf", "scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280,fps=30", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "29", "-threads", "2", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "96k", "-movflags", "+faststart", output_file]
-    run_ffmpeg(chat_id, command, timeout=LIVE_CONVERT_TIMEOUT)
-    return bool(face_crop), score
-
-
 def process_recorded_video(url, chat_id):
     try:
-        send_message(chat_id, "⏳ بدأت معالجة الفيديو المسجل. سيتم اختيار أفضل مقطع من كل فترة تحليل، ومدة المقطع 60 ثانية.")
+        send_message(chat_id, "⏳ بدأت معالجة الفيديو المسجل. مدة كل مقطع 60 ثانية.")
         with tempfile.TemporaryDirectory() as folder:
             ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
             output = os.path.join(folder, "source.%(ext)s")
+
             if not (os.path.isfile(DENO_PATH) and os.access(DENO_PATH, os.X_OK)):
                 raise RuntimeError(f"Deno missing or not executable: {DENO_PATH}")
+
             options = {
-                "outtmpl": output, "format": "bestvideo*+bestaudio/best", "noplaylist": True,
-                "quiet": False, "no_warnings": False, "socket_timeout": 60, "retries": 3,
-                "fragment_retries": 3, "ffmpeg_location": ffmpeg, "merge_output_format": "mp4",
-                "js_runtimes": {"deno": {"path": DENO_PATH}}, "remote_components": ["ejs:github"],
-                "progress_hooks": [lambda data: (_ for _ in ()).throw(yt_dlp.utils.DownloadError("STOP_REQUESTED")) if is_stopped(chat_id) else None],
+                "outtmpl": output,
+                "format": "bestvideo*+bestaudio/best",
+                "noplaylist": True,
+                "quiet": False,
+                "no_warnings": False,
+                "socket_timeout": 60,
+                "retries": 3,
+                "fragment_retries": 3,
+                "ffmpeg_location": ffmpeg,
+                "merge_output_format": "mp4",
+                "js_runtimes": {"deno": {"path": DENO_PATH}},
+                "remote_components": ["ejs:github"],
+                "progress_hooks": [
+                    lambda data: (_ for _ in ()).throw(
+                        yt_dlp.utils.DownloadError("STOP_REQUESTED")
+                    ) if is_stopped(chat_id) else None
+                ]
             }
+
             if "youtube.com" in url or "youtu.be" in url:
                 if os.path.isfile(COOKIES_FILE):
                     writable_cookies = os.path.join(folder, "cookies.txt")
                     shutil.copyfile(COOKIES_FILE, writable_cookies)
                     options["cookiefile"] = writable_cookies
+
             if is_stopped(chat_id):
                 raise InterruptedError("تم إيقاف العمل.")
+
             with yt_dlp.YoutubeDL(options) as ydl:
                 info = ydl.extract_info(url, download=True)
+
             if is_stopped(chat_id):
                 raise InterruptedError("تم إيقاف العمل.")
-            downloaded = [f for f in glob.glob(os.path.join(folder, "source.*")) if os.path.isfile(f) and not f.endswith((".part", ".ytdl"))]
+
+            downloaded = [
+                f for f in glob.glob(os.path.join(folder, "source.*"))
+                if os.path.isfile(f) and not f.endswith((".part", ".ytdl"))
+            ]
             if not downloaded:
                 raise RuntimeError("Downloaded video file not found")
+
             filename = max(downloaded, key=os.path.getsize)
-            duration = float(info.get("duration") or probe_duration(filename, ffmpeg) or 0)
-            groups = min(10, int(duration // LIVE_SEGMENT_SECONDS))
-            if groups < 1:
-                raise RuntimeError("الفيديو أقصر من 3 دقائق؛ نحتاج 3 دقائق لاختيار أفضل 60 ثانية.")
-            send_message(chat_id, f"🎬 اكتمل التحميل. فترات التحليل: {groups}. سيتم اختيار أفضل 60 ثانية من كل فترة.")
+            duration = info.get("duration") or CLIP_LENGTH_SECONDS
+            clip_count = min(10, max(1, int(
+                (duration + CLIP_LENGTH_SECONDS - 1) // CLIP_LENGTH_SECONDS
+            )))
+            send_message(
+                chat_id,
+                f"🎬 اكتمل التحميل. إجمالي المقاطع: {clip_count}.\n"
+                f"📋 الحالة: 0 من {clip_count} مكتملة — المتبقي {clip_count}."
+            )
+
             completed = 0
-            for i in range(groups):
+            for i in range(clip_count):
                 if is_stopped(chat_id):
                     raise InterruptedError("تم إيقاف العمل.")
-                result = os.path.join(folder, f"highlight_{i + 1}.mp4")
-                send_message(chat_id, f"🔎 تحليل الفترة {i + 1} من {groups} لاختيار أفضل لحظة...")
-                has_face, score = export_highlight(chat_id, filename, result, ffmpeg, source_offset=i * LIVE_SEGMENT_SECONDS)
+
+                remaining_before = clip_count - completed
+                send_message(
+                    chat_id,
+                    f"⚙️ جاري تجهيز المقطع {i + 1} من {clip_count}.\n"
+                    f"📋 المقاطع المكتملة: {completed} — المتبقية: {remaining_before}."
+                )
+
+                start = i * CLIP_LENGTH_SECONDS
+                result = os.path.join(folder, f"clip_{i + 1}.mp4")
+                command = [
+                    ffmpeg, "-y", "-ss", str(start), "-i", filename,
+                    "-t", str(CLIP_LENGTH_SECONDS),
+                    "-vf",
+                    "scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280,fps=30",
+                    "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
+                    "-threads", "2", "-pix_fmt", "yuv420p",
+                    "-c:a", "aac", "-movflags", "+faststart", result
+                ]
+                run_ffmpeg(chat_id, command, timeout=RECORDED_CONVERT_TIMEOUT)
+
                 if is_stopped(chat_id):
                     raise InterruptedError("تم إيقاف العمل.")
-                caption = f"أفضل لحظة {i + 1} من {groups} — 60 ثانية — " + ("كاميرا الوجه مدمجة" if has_face else "اللعب فقط")
-                send_document(chat_id, result, caption)
+
+                send_document(chat_id, result, f"المقطع {i + 1} من {clip_count} — 60 ثانية")
                 completed += 1
-                send_message(chat_id, f"✅ تم إرسال أفضل مقطع {completed} من {groups}. المتبقي: {groups - completed}.")
-                try:
-                    os.remove(result)
-                except OSError:
-                    pass
-            send_message(chat_id, "🎉 انتهت معالجة الفيديو واختيار أفضل اللحظات.")
+                send_message(
+                    chat_id,
+                    f"✅ تم إرسال المقطع {completed} من {clip_count}.\n"
+                    f"📋 المتبقي: {clip_count - completed} مقطع."
+                )
+
+            send_message(chat_id, "🎉 انتهت معالجة الفيديو المسجل وإرسال جميع المقاطع!")
+
     except InterruptedError:
         send_message(chat_id, "⏹️ تم إيقاف المعالجة.")
     except Exception as exc:
         traceback.print_exc()
         print(f"RECORDED ERROR: {type(exc).__name__}: {exc}", flush=True)
-        send_message(chat_id, f"❌ فشلت معالجة الفيديو المسجل: {type(exc).__name__}: {exc}")
+        if is_stopped(chat_id):
+            send_message(chat_id, "⏹️ تم إيقاف المعالجة.")
+        else:
+            send_message(chat_id, f"❌ فشلت معالجة الفيديو المسجل: {type(exc).__name__}: {exc}")
     finally:
         with JOBS_LOCK:
             JOBS.pop(chat_id, None)
+
+
+def convert_live_segment(chat_id, segment_file, output_file, ffmpeg):
+    command = [
+        ffmpeg, "-y", "-i", segment_file,
+        "-map", "0:v:0", "-map", "0:a?",
+        "-vf",
+        "scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280,fps=30",
+        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "30",
+        "-threads", "2", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "96k",
+        "-movflags", "+faststart", output_file
+    ]
+    run_ffmpeg(chat_id, command, timeout=LIVE_CONVERT_TIMEOUT)
 
 
 def process_youtube_live(url, chat_id):
     capture_process = None
     sent_count = 0
     try:
-        send_message(chat_id, "🔴 جاري الاتصال ببث YouTube Live. سيتم تحليل كل 3 دقائق واختيار أفضل 60 ثانية ثم إرسالها.")
+        send_message(
+            chat_id,
+            "🔴 جاري الاتصال ببث YouTube Live.\n"
+            "سيتم استقبال المقاطع وتحويلها وإرسالها تباعاً، مدة كل مقطع نحو 60 ثانية."
+        )
+
         with tempfile.TemporaryDirectory() as folder:
             capture_dir = os.path.join(folder, "live_segments")
             os.makedirs(capture_dir, exist_ok=True)
-            capture = start_live_capture(url, capture_dir, segment_seconds=LIVE_SEGMENT_SECONDS)
+
+            capture = start_live_capture(
+                url, capture_dir, segment_seconds=LIVE_SEGMENT_SECONDS
+            )
             capture_process = capture["process"]
             register_process(chat_id, capture_process)
-            send_message(chat_id, f"📡 تم الاتصال بالبث: {capture.get('title', 'YouTube Live')}.\n⏳ أول اختيار بعد اكتمال فترة تحليل تقارب 3 دقائق.")
+
+            send_message(
+                chat_id,
+                f"📡 تم الاتصال بالبث: {capture.get('title', 'YouTube Live')}.\n"
+                "📋 الحالة: بانتظار اكتمال أول مقطع."
+            )
+
             ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
             processed_files = set()
+            last_status_count = -1
+
             while True:
                 if is_stopped(chat_id):
                     raise InterruptedError("تم إيقاف استقبال البث.")
-                segments = sorted(glob.glob(os.path.join(capture_dir, "live_*.ts")))
+
+                segments = sorted(
+                    glob.glob(os.path.join(capture_dir, "live_*.ts"))
+                )
                 capture_finished = capture_process.poll() is not None
+
+                # While capture is running, the newest TS file is still being written.
+                # Once another segment appears, all earlier files are closed and safe.
                 ready_segments = segments if capture_finished else segments[:-1]
+
                 for segment_file in ready_segments:
                     if segment_file in processed_files:
                         continue
-                    processed_files.add(segment_file)
-                    segment_number = sent_count + 1
-                    output_file = os.path.join(folder, f"live_highlight_{segment_number}.mp4")
-                    segment_duration = probe_duration(segment_file, ffmpeg)
-                    if segment_duration and segment_duration < CLIP_LENGTH_SECONDS:
-                        print(f"[live] Skipping short final segment: {segment_duration:.1f}s", flush=True)
-                        try:
-                            os.remove(segment_file)
-                        except OSError:
-                            pass
-                        continue
-                    send_message(chat_id, f"🔎 اكتمل جزء من البث. جاري تحليل أفضل 60 ثانية للمقطع {segment_number}...")
-                    has_face, score = export_highlight(chat_id, segment_file, output_file, ffmpeg)
                     if is_stopped(chat_id):
                         raise InterruptedError("تم إيقاف استقبال البث.")
-                    caption = f"أفضل لحظة من البث — 60 ثانية — " + ("كاميرا الوجه مدمجة" if has_face else "اللعب فقط")
-                    send_document(chat_id, output_file, caption)
+
+                    processed_files.add(segment_file)
+                    segment_number = sent_count + 1
+                    output_file = os.path.join(
+                        folder, f"live_clip_{segment_number}.mp4"
+                    )
+
+                    send_message(
+                        chat_id,
+                        f"⚙️ اكتمل جزء جديد من البث. جاري تحويل المقطع {segment_number}.\n"
+                        f"✅ المقاطع المرسلة: {sent_count}."
+                    )
+
+                    convert_live_segment(
+                        chat_id, segment_file, output_file, ffmpeg
+                    )
+
+                    if is_stopped(chat_id):
+                        raise InterruptedError("تم إيقاف استقبال البث.")
+
+                    send_document(
+                        chat_id,
+                        output_file,
+                        f"YouTube Live — المقطع {segment_number} — نحو 60 ثانية"
+                    )
                     sent_count += 1
-                    for path in (segment_file, output_file):
-                        try:
-                            os.remove(path)
-                        except OSError:
-                            pass
-                    send_message(chat_id, f"✅ تم إرسال أفضل مقطع {sent_count}.\n📡 استقبال البث مستمر.")
+
+                    try:
+                        os.remove(segment_file)
+                    except OSError:
+                        pass
+                    try:
+                        os.remove(output_file)
+                    except OSError:
+                        pass
+
+                    send_message(
+                        chat_id,
+                        f"✅ تم إرسال المقطع {sent_count} من البث المباشر.\n"
+                        "📡 الحالة: استقبال البث مستمر وانتظار الجزء التالي."
+                    )
+
                 if capture_finished:
-                    remaining = [p for p in segments if p not in processed_files]
-                    if not remaining:
+                    # The capture process has ended; the final segment is now closed.
+                    remaining_segments = [
+                        path for path in segments if path not in processed_files
+                    ]
+                    if not remaining_segments:
                         break
+
                 time.sleep(LIVE_POLL_SECONDS)
+
             if sent_count:
-                send_message(chat_id, f"🎉 انتهى استقبال البث. إجمالي المقاطع المرسلة: {sent_count}.")
+                send_message(
+                    chat_id,
+                    f"🎉 انتهى استقبال البث وإرسال المقاطع.\n"
+                    f"إجمالي المقاطع المرسلة: {sent_count}."
+                )
             else:
                 raise RuntimeError("انتهى البث دون العثور على مقاطع مكتملة.")
+
     except InterruptedError:
-        send_message(chat_id, f"⏹️ تم إيقاف استقبال البث. المقاطع التي أُرسلت: {sent_count}.")
+        send_message(
+            chat_id,
+            f"⏹️ تم إيقاف استقبال البث.\nالمقاطع التي أُرسلت: {sent_count}."
+        )
     except Exception as exc:
         traceback.print_exc()
         print(f"LIVE ERROR: {type(exc).__name__}: {exc}", flush=True)
-        send_message(chat_id, f"❌ تعذر استقبال البث: {type(exc).__name__}: {exc}\nالمقاطع التي أُرسلت: {sent_count}.")
+        if is_stopped(chat_id):
+            send_message(
+                chat_id,
+                f"⏹️ تم إيقاف استقبال البث.\nالمقاطع التي أُرسلت: {sent_count}."
+            )
+        else:
+            send_message(
+                chat_id,
+                f"❌ تعذر استقبال البث: {type(exc).__name__}: {exc}\n"
+                f"المقاطع التي أُرسلت: {sent_count}."
+            )
     finally:
-     
+        if capture_process is not None:
+            try:
+                stop_live_capture(capture_process)
+            except Exception:
+                traceback.print_exc()
+        with JOBS_LOCK:
+            JOBS.pop(chat_id, None)
+
+
+def process_submitted_url(url, chat_id):
+    if is_youtube_live_url(url):
+        process_youtube_live(url, chat_id)
+    else:
+        process_recorded_video(url, chat_id)
+
+
+def start_pending_link(chat_id, link_id):
+    with pending_lock:
+        url = pending_links.pop(link_id, None)
+    if not url:
+        send_message(chat_id, "انتهت صلاحية الرابط أو تم تشغيله مسبقاً.")
+        return
+
+    with JOBS_LOCK:
+        if chat_id in JOBS:
+            send_message(chat_id, "⚠️ يوجد عمل جارٍ بالفعل. أوقفه أولاً.")
+            return
+        JOBS[chat_id] = {
+            "stop_event": threading.Event(),
+            "process": None,
+            "link_id": link_id
+        }
+
+    send_message(chat_id, "▶️ بدأ العمل. يمكنك إيقافه من الزر أدناه.")
+    threading.Thread(
+        target=process_submitted_url, args=(url, chat_id), daemon=True
+    ).start()
+
+
+def stop_chat_job(chat_id):
+    with JOBS_LOCK:
+        job = JOBS.get(chat_id)
+        if not job:
+            return False, None
+        job["stop_event"].set()
+        process = job.get("process")
+
+    if process is not None:
+        try:
+            if process.poll() is None:
+                process.terminate()
+        except Exception as exc:
+            print(f"Stop process error: {exc}", flush=True)
+
+    return True, process
+
+
+def make_control_keyboard(link_id):
+    return {
+        "inline_keyboard": [[
+            {"text": "▶️ ابدأ العمل", "callback_data": f"start:{link_id}"},
+            {"text": "⏹ إيقاف العمل", "callback_data": f"stop:{link_id}"}
+        ]]
+    }
+
+
+@app.route("/", methods=["GET"])
+def home():
+    return "GTA 6 AI Clipper Bot is running!"
+
+
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    data = request.get_json(silent=True) or {}
+    callback = data.get("callback_query")
+
+    if callback:
+        callback_id = callback.get("id")
+        callback_data = callback.get("data", "")
+        chat_id = callback.get("message", {}).get("chat", {}).get("id")
+
+        if callback_data.startswith("start:") and chat_id:
+            answer_callback_query(callback_id, "بدء العمل")
+            start_pending_link(chat_id, callback_data.split(":", 1)[1])
+        elif callback_data.startswith("stop:") and chat_id:
+            answer_callback_query(callback_id, "تم إرسال طلب الإيقاف")
+            stopped, _ = stop_chat_job(chat_id)
+            send_message(
+                chat_id,
+                "⏹️ تم إرسال طلب إيقاف العمل." if stopped
+                else "لا يوجد عمل جارٍ لإيقافه."
+            )
+        else:
+            answer_callback_query(callback_id, "طلب غير معروف")
+
+        return "OK", 200
+
+    message = data.get("message", {})
+    chat_id = message.get("chat", {}).get("id")
+    text = message.get("text", "").strip()
+
+    if not chat_id or not text:
+        return "OK", 200
+
+    if text.startswith("/start"):
+        send_message(
+            chat_id,
+            "🎮 أهلاً بك في GTA 6 AI Clipper Bot!\n"
+            "أرسل رابط فيديو مسجل أو رابط YouTube Live، ثم اضغط زر ابدأ العمل.\n"
+            "مدة المقاطع: 60 ثانية."
+        )
+    elif text.startswith(("http://", "https://")):
+        link_id = uuid.uuid4().hex[:12]
+        with pending_lock:
+            pending_links[link_id] = text
+
+        if is_youtube_live_url(text):
+            description = "🔴 تم استلام رابط YouTube Live. استخدم الزرين للتحكم."
+        else:
+            description = "🎬 تم استلام رابط الفيديو. مدة كل مقطع 60 ثانية."
+
+        send_message(
+            chat_id,
+            description,
+            reply_markup=make_control_keyboard(link_id)
+        )
+    else:
+        send_message(chat_id, "أرسل رابط فيديو أو رابط YouTube Live أولاً.")
+
+    return "OK", 200
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
+            
