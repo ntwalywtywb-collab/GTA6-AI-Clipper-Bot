@@ -288,4 +288,4 @@ def stop_live_capture(process) -> bool:
         process.wait()
 
     return True
-    
+        
