@@ -1,8 +1,8 @@
 import os
 import shutil
-import subprocess
 import tempfile
-from typing import List, Optional, Tuple
+import subprocess
+import time
 
 import yt_dlp
 import imageio_ffmpeg
@@ -11,157 +11,212 @@ COOKIES_FILE = "/etc/secrets/m.youtube.com_cookies.txt"
 DENO_PATH = "/opt/render/project/src/.deno/bin/deno"
 
 
-def _base_options(cookie_path: Optional[str] = None, player_client: Optional[str] = None) -> dict:
+def _cookie_copy(options):
+    """Copy Render's read-only secret into a writable temporary file."""
+    if not (os.path.isfile(COOKIES_FILE) and os.access(COOKIES_FILE, os.R_OK)):
+        return None
+    fd, path = tempfile.mkstemp(prefix="yt_cookies_", suffix=".txt", dir="/tmp")
+    os.close(fd)
+    shutil.copyfile(COOKIES_FILE, path)
+    options["cookiefile"] = path
+    return path
+
+
+def _choose_format(info):
+    """Prefer a muxed live stream up to 720p/30fps to reduce bandwidth."""
+    direct = info.get("url")
+    formats = info.get("formats") or []
+
+    candidates = []
+    for fmt in formats:
+        if not fmt.get("url"):
+            continue
+        if fmt.get("vcodec") in (None, "none"):
+            continue
+        if fmt.get("acodec") in (None, "none"):
+            continue
+        height = int(fmt.get("height") or 0)
+        fps = float(fmt.get("fps") or 0)
+        protocol = str(fmt.get("protocol") or "")
+        # Prefer streams that are already muxed and not above 720p.
+        within_target = 1 if (height == 0 or height <= 720) else 0
+        fps_target = 1 if (fps == 0 or fps <= 30) else 0
+        hls = 1 if ("m3u8" in protocol or "http" in protocol) else 0
+        candidates.append((
+            within_target,
+            fps_target,
+            hls,
+            min(height or 720, 720),
+            min(fps or 30, 30),
+            fmt
+        ))
+
+    if candidates:
+        candidates.sort(key=lambda item: item[:-1], reverse=True)
+        chosen = candidates[0][-1]
+        return {
+            "url": chosen["url"],
+            "headers": chosen.get("http_headers") or info.get("http_headers") or {},
+            "format_id": chosen.get("format_id"),
+            "height": chosen.get("height"),
+        }
+
+    if direct:
+        return {
+            "url": direct,
+            "headers": info.get("http_headers") or {},
+            "format_id": info.get("format_id"),
+            "height": info.get("height"),
+        }
+
+    # Last resort: a video-only stream can still be captured; audio is optional.
+    video_only = [
+        f for f in formats
+        if f.get("url") and f.get("vcodec") not in (None, "none")
+    ]
+    if video_only:
+        video_only.sort(
+            key=lambda f: min(int(f.get("height") or 720), 720),
+            reverse=True
+        )
+        chosen = video_only[0]
+        return {
+            "url": chosen["url"],
+            "headers": chosen.get("http_headers") or info.get("http_headers") or {},
+            "format_id": chosen.get("format_id"),
+            "height": chosen.get("height"),
+        }
+
+    raise RuntimeError("YouTube لم يُرجع رابط بث مباشر قابلاً للاستخدام.")
+
+
+def get_live_stream(url):
+    """Extract a direct URL without forcing yt-dlp's 'best' format selector."""
+    if "youtube.com" not in url and "youtu.be" not in url:
+        raise ValueError("هذا الإصدار يدعم روابط YouTube Live فقط.")
+
     options = {
         "noplaylist": True,
-        "quiet": False,
+        "quiet": True,
         "no_warnings": False,
+        "cachedir": False,
         "socket_timeout": 35,
         "retries": 4,
         "fragment_retries": 4,
         "extractor_retries": 3,
         "live_from_start": False,
-        "cachedir": False,
         "skip_download": True,
     }
-    if cookie_path:
-        options["cookiefile"] = cookie_path
+
     if os.path.isfile(DENO_PATH) and os.access(DENO_PATH, os.X_OK):
         options["js_runtimes"] = {"deno": {"path": DENO_PATH}}
         options["remote_components"] = ["ejs:github"]
-    if player_client:
-        options["extractor_args"] = {"youtube": {"player_client": [player_client], "formats": ["incomplete"]}}
-    return options
 
-
-def _is_video(fmt: dict) -> bool:
-    return bool(fmt.get("url")) and fmt.get("vcodec") not in (None, "none")
-
-
-def _is_audio(fmt: dict) -> bool:
-    return bool(fmt.get("url")) and fmt.get("acodec") not in (None, "none")
-
-
-def _format_score(fmt: dict) -> Tuple[int, int, float]:
-    protocol = (fmt.get("protocol") or "").lower()
-    protocol_score = 100 if "m3u8" in protocol else 50 if protocol in ("https", "http") else 10
-    return protocol_score, int(fmt.get("height") or 0), float(fmt.get("tbr") or 0)
-
-
-def _choose_formats(info: dict) -> Tuple[dict, Optional[dict]]:
-    formats = [f for f in (info.get("formats") or []) if isinstance(f, dict) and f.get("url") and not f.get("has_drm")]
-    combined = [f for f in formats if _is_video(f) and _is_audio(f)]
-    if combined:
-        return sorted(combined, key=_format_score, reverse=True)[0], None
-    videos = sorted([f for f in formats if _is_video(f)], key=_format_score, reverse=True)
-    audios = sorted([f for f in formats if _is_audio(f)], key=_format_score, reverse=True)
-    if not videos:
-        raise RuntimeError("YouTube returned no usable video stream formats. Check yt-dlp logs, cookies, and player extraction.")
-    return videos[0], audios[0] if audios else None
-
-
-def _copy_cookies_to_temp() -> Optional[str]:
-    if not (os.path.isfile(COOKIES_FILE) and os.access(COOKIES_FILE, os.R_OK)):
-        return None
-    fd, temp_path = tempfile.mkstemp(prefix="youtube_cookies_", suffix=".txt", dir="/tmp")
-    os.close(fd)
-    shutil.copyfile(COOKIES_FILE, temp_path)
-    return temp_path
-
-
-def _extract_raw_info(url: str, cookie_path: Optional[str]) -> dict:
-    attempts = [("default", None), ("tv", "tv"), ("mweb", "mweb"), ("ios", "ios"), ("web", "web")]
-    errors: List[str] = []
-    for label, player_client in attempts:
-        try:
-            print(f"[live] Extraction attempt: {label}", flush=True)
-            with yt_dlp.YoutubeDL(_base_options(cookie_path, player_client)) as ydl:
-                info = ydl.extract_info(url, download=False, process=False)
-            if not isinstance(info, dict):
-                raise RuntimeError("yt-dlp returned an empty or invalid result.")
-            if info.get("_type") == "playlist":
-                info = next((entry for entry in (info.get("entries") or []) if entry), None)
-            if not isinstance(info, dict):
-                raise RuntimeError("No video entry was returned by YouTube.")
-            usable = [f for f in (info.get("formats") or []) if isinstance(f, dict) and f.get("url") and (f.get("vcodec") not in (None, "none") or f.get("acodec") not in (None, "none"))]
-            if usable:
-                print(f"[live] {label}: received {len(usable)} usable stream format(s)", flush=True)
-                return info
-            errors.append(f"{label}: no usable formats returned")
-        except Exception as exc:
-            errors.append(f"{label}: {type(exc).__name__}: {exc}")
-            print(f"[live] {errors[-1]}", flush=True)
-    raise RuntimeError("All YouTube extraction methods failed:\n" + "\n".join(errors))
-
-
-def get_live_stream(url: str) -> dict:
-    if "youtube.com" not in url and "youtu.be" not in url:
-        raise ValueError("This module currently supports YouTube Live URLs only.")
-    temp_cookie_path = None
+    cookie_path = None
     try:
-        temp_cookie_path = _copy_cookies_to_temp()
-        info = _extract_raw_info(url, temp_cookie_path)
+        cookie_path = _cookie_copy(options)
+        with yt_dlp.YoutubeDL(options) as ydl:
+            # process=False avoids an early format-selection failure.
+            info = ydl.extract_info(url, download=False, process=False)
     finally:
-        if temp_cookie_path and os.path.exists(temp_cookie_path):
+        if cookie_path and os.path.exists(cookie_path):
             try:
-                os.remove(temp_cookie_path)
+                os.remove(cookie_path)
             except OSError:
                 pass
+
+    if not info:
+        raise RuntimeError("لم يتمكن yt-dlp من قراءة معلومات البث.")
+    if info.get("_type") == "playlist" and info.get("entries"):
+        info = next((entry for entry in info["entries"] if entry), None)
+    if not info:
+        raise RuntimeError("لم يتم العثور على معلومات البث.")
+
     live_status = info.get("live_status")
-    if live_status not in ("is_live", "was_live") and not info.get("is_live"):
-        raise RuntimeError(f"The supplied URL does not appear to be an active live stream (live_status={live_status!r}).")
-    video_fmt, audio_fmt = _choose_formats(info)
+    if live_status not in ("is_live", "is_upcoming") and not info.get("is_live"):
+        raise RuntimeError(
+            f"الرابط ليس بثاً مباشراً نشطاً حالياً (live_status={live_status})."
+        )
+
+    selected = _choose_format(info)
     return {
-        "url": video_fmt["url"],
-        "audio_url": audio_fmt.get("url") if audio_fmt else None,
+        "url": selected["url"],
         "title": info.get("title") or "YouTube Live",
-        "headers": video_fmt.get("http_headers") or info.get("http_headers") or {},
-        "audio_headers": (audio_fmt or {}).get("http_headers") or {},
-        "format_id": video_fmt.get("format_id"),
-        "audio_format_id": audio_fmt.get("format_id") if audio_fmt else None,
+        "headers": selected.get("headers") or {},
+        "format_id": selected.get("format_id"),
+        "height": selected.get("height"),
     }
 
 
-def _header_argument(headers: dict) -> str:
-    return "".join(f"{key}: {value}\r\n" for key, value in headers.items())
-
-
-def start_live_capture(url: str, output_dir: str, segment_seconds: int = 180) -> dict:
-    """Capture three-minute source chunks; the clipper chooses the best 60-second window."""
+def start_live_capture(url, output_dir, segment_seconds=60):
+    """Start low-overhead stream-copy capture into sequential MPEG-TS segments."""
     segment_seconds = int(segment_seconds)
-    if segment_seconds < 180:
-        raise ValueError("Live capture segments must be at least 180 seconds for highlight selection.")
+    if segment_seconds != 60:
+        raise ValueError("مدة أجزاء البث مضبوطة على 60 ثانية.")
+
     os.makedirs(output_dir, exist_ok=True)
     ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
     live = get_live_stream(url)
+
     output_pattern = os.path.join(output_dir, "live_%05d.ts")
+    headers = live.get("headers") or {}
+    header_text = "".join(
+        f"{key}: {value}\r\n" for key, value in headers.items()
+    )
+
     command = [ffmpeg, "-hide_banner", "-loglevel", "warning"]
-    video_headers = _header_argument(live.get("headers") or {})
-    if video_headers:
-        command.extend(["-headers", video_headers])
-    command.extend(["-i", live["url"]])
-    if live.get("audio_url"):
-        audio_headers = _header_argument(live.get("audio_headers") or {})
-        if audio_headers:
-            command.extend(["-headers", audio_headers])
-        command.extend(["-i", live["audio_url"], "-map", "0:v:0", "-map", "1:a:0"])
-    else:
-        command.extend(["-map", "0:v:0", "-map", "0:a:0?"])
-    command.extend(["-c", "copy", "-f", "segment", "-segment_time", str(segment_seconds), "-reset_timestamps", "1", "-segment_format", "mpegts", output_pattern])
-    print(f"[live] Starting FFmpeg capture; video format={live.get('format_id')}, audio format={live.get('audio_format_id')}, segment={segment_seconds}s", flush=True)
-    # Do not leave an unread PIPE attached: it can fill and stall a long-running capture.
-    process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    return {"process": process, "output_pattern": output_pattern, "title": live["title"], "segment_seconds": segment_seconds, "format_id": live.get("format_id")}
+    if header_text:
+        command.extend(["-headers", header_text])
+
+    command.extend([
+        "-rw_timeout", "20000000",
+        "-reconnect", "1",
+        "-reconnect_streamed", "1",
+        "-reconnect_delay_max", "5",
+        "-i", live["url"],
+        "-map", "0:v:0",
+        "-map", "0:a?",
+        "-c", "copy",
+        "-f", "segment",
+        "-segment_time", str(segment_seconds),
+        "-segment_time_delta", "1",
+        "-reset_timestamps", "1",
+        "-segment_format", "mpegts",
+        "-segment_start_number", "0",
+        output_pattern,
+    ])
+
+    log_path = os.path.join(output_dir, "capture_ffmpeg.log")
+    log_file = open(log_path, "ab")
+    try:
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.DEVNULL,
+            stderr=log_file,
+        )
+    finally:
+        log_file.close()
+
+    return {
+        "process": process,
+        "output_pattern": output_pattern,
+        "title": live["title"],
+        "segment_seconds": segment_seconds,
+        "format_id": live.get("format_id"),
+        "height": live.get("height"),
+        "log_path": log_path,
+    }
 
 
-def stop_live_capture(process) -> bool:
+def stop_live_capture(process):
+    """Stop FFmpeg safely and allow it to flush its current segment."""
     if process is None or process.poll() is not None:
         return False
     process.terminate()
     try:
-        process.wait(timeout=10)
+        process.wait(timeout=12)
     except subprocess.TimeoutExpired:
         process.kill()
-        process.wait()
+        process.wait(timeout=5)
     return True
-            
+    
