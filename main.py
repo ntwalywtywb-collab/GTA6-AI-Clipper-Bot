@@ -4,6 +4,8 @@ import glob
 import tempfile
 import subprocess
 import threading
+import shutil
+import traceback
 import requests
 import yt_dlp
 import imageio_ffmpeg
@@ -41,6 +43,8 @@ def process_video(url, chat_id):
 
         with tempfile.TemporaryDirectory() as folder:
 
+            ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+
             output = os.path.join(
                 folder,
                 "source.%(ext)s"
@@ -48,24 +52,49 @@ def process_video(url, chat_id):
 
             options = {
                 "outtmpl": output,
-                "format": "best[ext=mp4]/best",
+                "format": "best/bestvideo+bestaudio",
                 "noplaylist": True,
                 "quiet": True,
                 "no_warnings": True,
                 "socket_timeout": 60,
                 "retries": 3,
+                "fragment_retries": 3,
+                "ffmpeg_location": ffmpeg,
                 "merge_output_format": "mp4",
             }
 
-            # استخدام Cookies لروابط YouTube فقط
+            # نسخ Cookies إلى مجلد قابل للكتابة
             if "youtube.com" in url or "youtu.be" in url:
-                if os.path.isfile(COOKIES_FILE):
-                    options["cookiefile"] = COOKIES_FILE
-                    print("YouTube cookies file found.", flush=True)
-                else:
-                    print("YouTube cookies file not found.", flush=True)
 
+                if os.path.isfile(COOKIES_FILE):
+
+                    writable_cookies = os.path.join(
+                        folder,
+                        "cookies.txt"
+                    )
+
+                    shutil.copyfile(
+                        COOKIES_FILE,
+                        writable_cookies
+                    )
+
+                    options["cookiefile"] = writable_cookies
+
+                    print(
+                        "YouTube cookies copied to writable folder.",
+                        flush=True
+                    )
+
+                else:
+
+                    print(
+                        "YouTube cookies file not found.",
+                        flush=True
+                    )
+
+            # تحميل الفيديو
             with yt_dlp.YoutubeDL(options) as ydl:
+
                 info = ydl.extract_info(
                     url,
                     download=True
@@ -79,14 +108,16 @@ def process_video(url, chat_id):
                 f for f in files
                 if os.path.isfile(f)
                 and not f.endswith(".part")
+                and not f.endswith(".ytdl")
             ]
 
             if not files:
                 raise Exception("Downloaded video file not found")
 
-            filename = files[0]
+            filename = max(files, key=os.path.getsize)
 
             duration = info.get("duration") or 45
+
             clip_length = 45
 
             clip_count = min(
@@ -97,13 +128,12 @@ def process_video(url, chat_id):
                 )
             )
 
-            ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
-
             send_message(
                 chat_id,
                 "🎬 تم تحميل الفيديو! جاري تجهيز المقاطع..."
             )
 
+            # إنشاء وإرسال المقاطع
             for i in range(clip_count):
 
                 start = i * clip_length
@@ -142,8 +172,12 @@ def process_video(url, chat_id):
 
                     response = requests.post(
                         f"{API}/sendVideo",
-                        data={"chat_id": chat_id},
-                        files={"video": video},
+                        data={
+                            "chat_id": chat_id
+                        },
+                        files={
+                            "video": video
+                        },
                         timeout=300
                     )
 
@@ -168,7 +202,6 @@ def process_video(url, chat_id):
 
     except Exception as e:
 
-        import traceback
         traceback.print_exc()
 
         print(
@@ -184,6 +217,7 @@ def process_video(url, chat_id):
 
 @app.route("/", methods=["GET"])
 def home():
+
     return "GTA 6 AI Clipper Bot is running!"
 
 
@@ -205,7 +239,7 @@ def webhook():
             send_message(
                 chat_id,
                 "🎮 مرحباً بك في GTA 6 AI Clipper Bot!\n"
-                "أرسل رابط فيديو عام لبدء المعالجة."
+                "أرسل رابط فيديو لبدء المعالجة."
             )
 
         elif text.startswith(("http://", "https://")):
