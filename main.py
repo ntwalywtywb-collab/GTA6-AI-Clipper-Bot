@@ -229,7 +229,6 @@ def get_ffmpeg_filter(chat_id, video_path=None):
     if mode == "facecam":
         return "scale=810:1280:force_original_aspect_ratio=decrease,pad=810:1280:(ow-iw)/2:(oh-ih)/2,fps=30"
     else:
-        # المقاس الأعرض الجديد (810x1280) مع الإزاحة الثابتة 0.30 أو التتبع الذكي
         offset_expr = analyze_video_with_ai(video_path) if video_path else "in_w*0.30"
         return f"scale=810:1280:force_original_aspect_ratio=increase,crop=810:1280:({offset_expr}-405):(in_h-1280)/2,fps=30"
 
@@ -575,4 +574,8 @@ def webhook():
     else:
         send_message(chat_id, "أرسل رابط فيديو أو رابط YouTube Live أولاً.")
 
-    retu
+    return "OK", 200
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 10
