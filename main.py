@@ -54,8 +54,12 @@ def process_video(url, chat_id):
                 "outtmpl": output,
                 "format": "best/bestvideo+bestaudio",
                 "noplaylist": True,
-                "quiet": True,
-                "no_warnings": True,
+
+                # وضع التشخيص
+                "quiet": False,
+                "no_warnings": False,
+                "verbose": True,
+
                 "socket_timeout": 60,
                 "retries": 3,
                 "fragment_retries": 3,
@@ -63,7 +67,7 @@ def process_video(url, chat_id):
                 "merge_output_format": "mp4",
             }
 
-            # نسخ Cookies إلى مجلد قابل للكتابة
+            # إعداد Cookies ليوتيوب
             if "youtube.com" in url or "youtu.be" in url:
 
                 if os.path.isfile(COOKIES_FILE):
@@ -93,6 +97,8 @@ def process_video(url, chat_id):
                     )
 
             # تحميل الفيديو
+            print("Starting video extraction...", flush=True)
+
             with yt_dlp.YoutubeDL(options) as ydl:
 
                 info = ydl.extract_info(
@@ -112,9 +118,14 @@ def process_video(url, chat_id):
             ]
 
             if not files:
-                raise Exception("Downloaded video file not found")
+                raise Exception(
+                    "Downloaded video file not found"
+                )
 
-            filename = max(files, key=os.path.getsize)
+            filename = max(
+                files,
+                key=os.path.getsize
+            )
 
             duration = info.get("duration") or 45
 
@@ -124,7 +135,10 @@ def process_video(url, chat_id):
                 10,
                 max(
                     1,
-                    int((duration + clip_length - 1) // clip_length)
+                    int(
+                        (duration + clip_length - 1)
+                        // clip_length
+                    )
                 )
             )
 
@@ -133,7 +147,7 @@ def process_video(url, chat_id):
                 "🎬 تم تحميل الفيديو! جاري تجهيز المقاطع..."
             )
 
-            # إنشاء وإرسال المقاطع
+            # إنشاء المقاطع
             for i in range(clip_count):
 
                 start = i * clip_length
@@ -168,6 +182,7 @@ def process_video(url, chat_id):
                     timeout=600
                 )
 
+                # إرسال المقطع إلى تيليجرام
                 with open(result, "rb") as video:
 
                     response = requests.post(
