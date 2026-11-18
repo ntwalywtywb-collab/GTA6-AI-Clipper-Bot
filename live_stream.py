@@ -1,10 +1,14 @@
 import os
+import shutil
 import subprocess
+import tempfile
 
 import yt_dlp
 import imageio_ffmpeg
 
 
+# Render Secret Files are read-only. We copy cookies to /tmp so yt-dlp
+# can safely read/update its cookie jar without trying to write to /etc/secrets.
 COOKIES_FILE = "/etc/secrets/m.youtube.com_cookies.txt"
 DENO_PATH = "/opt/render/project/src/.deno/bin/deno"
 
@@ -25,15 +29,30 @@ def get_live_stream(url):
         "live_from_start": False,
     }
 
-    if os.path.isfile(DENO_PATH):
+    if os.path.isfile(DENO_PATH) and os.access(DENO_PATH, os.X_OK):
         options["js_runtimes"] = {"deno": {"path": DENO_PATH}}
         options["remote_components"] = ["ejs:github"]
 
-    if os.path.isfile(COOKIES_FILE):
-        options["cookiefile"] = COOKIES_FILE
+    temp_cookie_path = None
 
-    with yt_dlp.YoutubeDL(options) as ydl:
-        info = ydl.extract_info(url, download=False)
+    try:
+        if os.path.isfile(COOKIES_FILE) and os.access(COOKIES_FILE, os.R_OK):
+            fd, temp_cookie_path = tempfile.mkstemp(
+                prefix="youtube_cookies_", suffix=".txt", dir="/tmp"
+            )
+            os.close(fd)
+            shutil.copyfile(COOKIES_FILE, temp_cookie_path)
+            options["cookiefile"] = temp_cookie_path
+
+        with yt_dlp.YoutubeDL(options) as ydl:
+            info = ydl.extract_info(url, download=False)
+
+    finally:
+        if temp_cookie_path and os.path.exists(temp_cookie_path):
+            try:
+                os.remove(temp_cookie_path)
+            except OSError:
+                pass
 
     if info.get("live_status") != "is_live":
         raise RuntimeError("The supplied URL is not an active live stream.")
@@ -66,7 +85,7 @@ def start_live_capture(url, output_dir, segment_seconds=60):
 
     headers = live.get("headers", {})
     header_text = "".join(
-        f"{key}: {value}\r\n" for key, value in headers.items()
+        f"{key}: {value}\\r\\n" for key, value in headers.items()
     )
 
     command = [ffmpeg, "-hide_banner", "-loglevel", "warning"]
