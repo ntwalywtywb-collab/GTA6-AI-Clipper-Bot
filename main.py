@@ -177,13 +177,13 @@ def get_ffmpeg_filter(chat_id, video_path=None):
     if mode == "facecam":
         return "scale=810:1280:force_original_aspect_ratio=decrease,pad=810:1280:(ow-iw)/2:(oh-ih)/2,fps=30"
     else:
-        # تعديل الإزاحة فقط لتصبح 0.45
+        # المقاس 810x1280 مع إزاحة 0.45
         return "scale=810:1280:force_original_aspect_ratio=increase,crop=810:1280:(in_w*0.45-405):(in_h-1280)/2,fps=30"
 
 
 def process_recorded_video(url, chat_id):
     try:
-        send_message(chat_id, "⏳ جاري التحميل والمعالجة بأعلى جودة نقاء (إزاحة 0.45)...")
+        send_message(chat_id, "⏳ جاري التحميل والمعالجة المستقرة (810x1280 - إزاحة 0.45)...")
         with tempfile.TemporaryDirectory() as folder:
             ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
             output = os.path.join(folder, "source.%(ext)s")
@@ -241,7 +241,7 @@ def process_recorded_video(url, chat_id):
             clip_count = min(10, max(1, int(
                 (duration + CLIP_LENGTH_SECONDS - 1) // CLIP_LENGTH_SECONDS
             )))
-            send_message(chat_id, f"🎬 بدء معالجة {clip_count} مقاطع بأقصى درجة وضوح ونقاء...")
+            send_message(chat_id, f"🎬 بدء معالجة {clip_count} مقاطع بشكل مستقر وآمن للسيرفر...")
 
             completed = 0
             for i in range(clip_count):
@@ -251,20 +251,21 @@ def process_recorded_video(url, chat_id):
                 start = i * CLIP_LENGTH_SECONDS
                 result = os.path.join(folder, f"clip_{i + 1}.mp4")
                 
+                # استخدام preset fast مع CRF 21 لمنع انهيار السيرفر بسبب استهلاك الذاكرة
                 command = [
                     ffmpeg, "-y", "-ss", str(start), "-i", filename,
                     "-t", str(CLIP_LENGTH_SECONDS),
                     "-vf", vf_filter,
-                    "-c:v", "libx264", "-preset", "slow", "-crf", "15",
+                    "-c:v", "libx264", "-preset", "fast", "-crf", "21",
                     "-threads", "2", "-pix_fmt", "yuv420p",
-                    "-c:a", "aac", "-b:a", "320k", "-movflags", "+faststart", result
+                    "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", result
                 ]
                 run_ffmpeg(chat_id, command, timeout=RECORDED_CONVERT_TIMEOUT)
 
                 if is_stopped(chat_id):
                     raise InterruptedError("تم إيقاف العمل.")
 
-                send_document(chat_id, result, f"المقطع {i + 1} من {clip_count} — جودة فائقة (810x1280)")
+                send_document(chat_id, result, f"المقطع {i + 1} من {clip_count} — (810x1280)")
                 
                 try:
                     if os.path.exists(result):
@@ -275,7 +276,7 @@ def process_recorded_video(url, chat_id):
                 completed += 1
                 gc.collect()
 
-            send_message(chat_id, "🎉 انتهت المعالجة بأقصى جودة ونقاء بنجاح تام!")
+            send_message(chat_id, "🎉 انتهت المعالجة وإرسال جميع المقاطع بنجاح تام!")
 
     except InterruptedError:
         send_message(chat_id, "⏹️ تم إيقاف المعالجة.")
@@ -294,9 +295,9 @@ def convert_live_segment(chat_id, segment_file, output_file, ffmpeg):
         ffmpeg, "-y", "-i", segment_file,
         "-map", "0:v:0", "-map", "0:a?",
         "-vf", vf_filter,
-        "-c:v", "libx264", "-preset", "slow", "-crf", "16",
+        "-c:v", "libx264", "-preset", "fast", "-crf", "22",
         "-threads", "2", "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-b:a", "320k",
+        "-c:a", "aac", "-b:a", "192k",
         "-movflags", "+faststart", output_file
     ]
     run_ffmpeg(chat_id, command, timeout=LIVE_CONVERT_TIMEOUT)
@@ -306,7 +307,7 @@ def process_youtube_live(url, chat_id):
     capture_process = None
     sent_count = 0
     try:
-        send_message(chat_id, "🔴 جاري الاتصال ببث YouTube Live بجودة فائقة...")
+        send_message(chat_id, "🔴 جاري الاتصال ببث YouTube Live...")
         with tempfile.TemporaryDirectory() as folder:
             capture_dir = os.path.join(folder, "live_segments")
             os.makedirs(capture_dir, exist_ok=True)
@@ -342,7 +343,7 @@ def process_youtube_live(url, chat_id):
                     if is_stopped(chat_id):
                         raise InterruptedError("تم إيقاف استقبال البث.")
 
-                    send_document(chat_id, output_file, f"YouTube Live — المقطع فائق النقاء {sent_count}")
+                    send_document(chat_id, output_file, f"YouTube Live — المقطع {sent_count}")
 
                     try:
                         os.remove(segment_file)
@@ -402,7 +403,7 @@ def start_pending_link(chat_id, link_id):
             "link_id": link_id
         }
 
-    send_message(chat_id, "▶️ بدأ العمل بجودة فائقة وإزاحة 0.45.")
+    send_message(chat_id, "▶️ بدأ العمل بالإزاحة 0.45 بشكل مستقر.")
     threading.Thread(target=process_submitted_url, args=(url, chat_id), daemon=True).start()
 
 
@@ -428,7 +429,7 @@ def make_control_keyboard(link_id):
     return {
         "inline_keyboard": [
             [
-                {"text": "💎 جودة فائقة (إزاحة 0.45)", "callback_data": f"mode:fullscreen:{link_id}"},
+                {"text": "🎯 إزاحة 0.45 (810x1280)", "callback_data": f"mode:fullscreen:{link_id}"},
                 {"text": "🎥 وسط + Facecam", "callback_data": f"mode:facecam:{link_id}"}
             ],
             [
@@ -462,7 +463,7 @@ def webhook():
             USER_PREFERENCES[chat_id] = mode
             
             mode_names = {
-                "fullscreen": "جودة فائقة (إزاحة 0.45)",
+                "fullscreen": "إزاحة 0.45 (810x1280)",
                 "facecam": "وسط + Facecam"
             }
             answer_callback_query(callback_id, f"تم اختيار: {mode_names.get(mode, mode)}")
@@ -502,8 +503,8 @@ def webhook():
     if text.startswith("/start"):
         send_message(
             chat_id,
-            "🎮 أهلاً بك في بوت معالجة الفيديوهات فائق النقاء!\n"
-            "أرسل رابط فيديو، وسيتم تطبيق إزاحة 0.45 بالمقاس 810x1280."
+            "🎮 أهلاً بك في بوت معالجة الفيديوهات المستقر!\n"
+            "أرسل رابط فيديو، وسيتم تطبيق إزاحة 0.45 بالمقاس 810x1280 بنجاح دون انقطاع."
         )
     elif text.startswith(("http://", "https://")):
         link_id = uuid.uuid4().hex[:12]
@@ -514,7 +515,7 @@ def webhook():
 
         send_message(
             chat_id,
-            "🎛️ تم استلام الرابط وتفعيل وضع الجودة الفائقة (إزاحة 0.45).\n"
+            "🎛️ تم استلام الرابط وتفعيل وضع (إزاحة 0.45 بمقاس 810x1280).\n"
             "اضغط (ابدأ العمل) للبدء:",
             reply_markup=make_control_keyboard(link_id)
         )
@@ -527,4 +528,4 @@ def webhook():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
-    
+            
