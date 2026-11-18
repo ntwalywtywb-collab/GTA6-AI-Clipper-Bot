@@ -56,13 +56,14 @@ def send_message(chat_id, message, reply_markup=None):
 
 
 def answer_callback_query(callback_id, message=None):
+    """تعديل آمن لتجاهل أخطاء انتهاء صلاحية الأزرار لتفادي خطأ 400"""
     payload = {"callback_query_id": callback_id}
     if message:
         payload["text"] = message
     try:
-        telegram_request("answerCallbackQuery", payload)
+        requests.post(f"{API}/answerCallbackQuery", json=payload, timeout=10)
     except Exception as exc:
-        print(f"Callback answer error: {exc}", flush=True)
+        print(f"Callback answer error (ignored): {exc}", flush=True)
 
 
 def send_document(chat_id, filename, caption=None):
@@ -141,7 +142,7 @@ def run_ffmpeg(chat_id, command, timeout=900):
 
 def process_recorded_video(url, chat_id):
     try:
-        send_message(chat_id, "⏳ بدأت معالجة الفيديو المسجل بدقة 1080p. مدة كل مقطع 60 ثانية.")
+        send_message(chat_id, "⏳ بدأت معالجة الفيديو المسجل بدقة 720p (مناسبة لخوادم Render). مدة كل مقطع 60 ثانية.")
         with tempfile.TemporaryDirectory() as folder:
             ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
             output = os.path.join(folder, "source.%(ext)s")
@@ -217,22 +218,22 @@ def process_recorded_video(url, chat_id):
                 start = i * CLIP_LENGTH_SECONDS
                 result = os.path.join(folder, f"clip_{i + 1}.mp4")
                 
-                # تعديل الفلتر ليصبح الفيديو في المنتصف بدقة 1080x1920 مع ترك مساحة في الأعلى لـ Facecam
+                # تصميم المنتصف والتأطير بدقة 720p
                 command = [
                     ffmpeg, "-y", "-ss", str(start), "-i", filename,
                     "-t", str(CLIP_LENGTH_SECONDS),
                     "-vf",
-                    "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2,fps=30",
-                    "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
-                    "-threads", "4", "-pix_fmt", "yuv420p",
-                    "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", result
+                    "scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2,fps=30",
+                    "-c:v", "libx264", "-preset", "veryfast", "-crf", "26",
+                    "-threads", "2", "-pix_fmt", "yuv420p",
+                    "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", result
                 ]
                 run_ffmpeg(chat_id, command, timeout=RECORDED_CONVERT_TIMEOUT)
 
                 if is_stopped(chat_id):
                     raise InterruptedError("تم إيقاف العمل.")
 
-                send_document(chat_id, result, f"المقطع {i + 1} من {clip_count} — 1080p")
+                send_document(chat_id, result, f"المقطع {i + 1} من {clip_count} — 720p")
                 completed += 1
                 send_message(
                     chat_id,
@@ -257,15 +258,14 @@ def process_recorded_video(url, chat_id):
 
 
 def convert_live_segment(chat_id, segment_file, output_file, ffmpeg):
-    # تعديل الفلتر للبث المباشر ليصبح الفيديو في المنتصف بدقة 1080x1920 مع ترك مساحة في الأعلى لـ Facecam
     command = [
         ffmpeg, "-y", "-i", segment_file,
         "-map", "0:v:0", "-map", "0:a?",
         "-vf",
-        "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2,fps=30",
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "24",
-        "-threads", "4", "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-b:a", "192k",
+        "scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2,fps=30",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "28",
+        "-threads", "2", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "128k",
         "-movflags", "+faststart", output_file
     ]
     run_ffmpeg(chat_id, command, timeout=LIVE_CONVERT_TIMEOUT)
@@ -277,7 +277,7 @@ def process_youtube_live(url, chat_id):
     try:
         send_message(
             chat_id,
-            "🔴 جاري الاتصال ببث YouTube Live (جودة 1080p).\n"
+            "🔴 جاري الاتصال ببث YouTube Live (دقة 720p).\n"
             "سيتم استقبال المقاطع وتحويلها وإرسالها تباعاً، مدة كل مقطع نحو 60 ثانية."
         )
 
@@ -339,7 +339,7 @@ def process_youtube_live(url, chat_id):
                     send_document(
                         chat_id,
                         output_file,
-                        f"YouTube Live — المقطع {segment_number} — 1080p"
+                        f"YouTube Live — المقطع {segment_number} — 720p"
                     )
                     sent_count += 1
 
@@ -505,7 +505,7 @@ def webhook():
             chat_id,
             "🎮 أهلاً بك في GTA 6 AI Clipper Bot!\n"
             "أرسل رابط فيديو مسجل أو رابط YouTube Live، ثم اضغط زر ابدأ العمل.\n"
-            "مدة المقاطع: 60 ثانية (بدقة 1080p وتصميم وسط الشاشة)."
+            "مدة المقاطع: 60 ثانية (بدقة 720p لتلائم قيود الخادم)."
         )
     elif text.startswith(("http://", "https://")):
         link_id = uuid.uuid4().hex[:12]
@@ -531,4 +531,4 @@ def webhook():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
-            
+    
