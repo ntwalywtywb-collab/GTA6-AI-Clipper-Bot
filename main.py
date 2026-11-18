@@ -520,6 +520,23 @@ def home():
     return "GTA 6 AI Clipper Bot is running!"
 
 
+SEEN_UPDATES = []
+SEEN_UPDATES_SET = set()
+SEEN_LOCK = threading.Lock()
+
+
+def is_duplicate_update(update_id):
+    """Telegram re-sends an update if it did not get a fast 200; ignore repeats."""
+    with SEEN_LOCK:
+        if update_id in SEEN_UPDATES_SET:
+            return True
+        SEEN_UPDATES.append(update_id)
+        SEEN_UPDATES_SET.add(update_id)
+        if len(SEEN_UPDATES) > 500:
+            SEEN_UPDATES_SET.discard(SEEN_UPDATES.pop(0))
+        return False
+
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
     if WEBHOOK_SECRET:
@@ -528,11 +545,24 @@ def webhook():
             return "Forbidden", 403
 
     data = request.get_json(silent=True) or {}
+    update_id = data.get("update_id")
+    if update_id is not None and is_duplicate_update(update_id):
+        return "OK", 200
+
+    # Always answer 200 so Telegram never retries a failing update in a loop.
+    try:
+        handle_update(data)
+    except Exception:
+        traceback.print_exc()
+    return "OK", 200
+
+
+def handle_update(data):
     callback = data.get("callback_query")
 
     if callback:
         callback_id = callback.get("id")
-        callback_data = callback.get("data", "")
+        callback_data = callback.get("data") or ""
         chat_id = callback.get("message", {}).get("chat", {}).get("id")
 
         if callback_data.startswith("start:") and chat_id:
@@ -543,30 +573,4 @@ def webhook():
             stopped, _ = stop_chat_job(chat_id)
             send_message(
                 chat_id,
-                "⏹️ تم إرسال طلب إيقاف العمل." if stopped
-                else "لا يوجد عمل جارٍ لإيقافه."
-            )
-        else:
-            answer_callback_query(callback_id, "طلب غير معروف")
-
-        return "OK", 200
-
-    message = data.get("message", {})
-    chat_id = message.get("chat", {}).get("id")
-    text = message.get("text", "").strip()
-
-    if not chat_id or not text:
-        return "OK", 200
-
-    if text.startswith("/start"):
-        send_message(
-            chat_id,
-            "🎮 أهلاً بك في GTA 6 AI Clipper Bot!\n"
-            "أرسل رابط فيديو مسجل أو رابط YouTube Live، ثم اضغط زر ابدأ العمل.\n"
-            "مدة المقاطع: 60 ثانية."
-        )
-    elif text.startswith(("http://", "https://")):
-        link_id = uuid.uuid4().hex[:12]
-        purge_pending_links()
-        with pending_lock:
-            pending
+                "⏹
