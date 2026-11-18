@@ -260,7 +260,7 @@ def process_recorded_video(url, chat_id):
                 remaining_before = clip_count - completed
                 send_message(
                     chat_id,
-                    f"⚙️ جاري تجهيز المقطع {i + 1} من {clip_count}.\n"
+                    f"⚙ جاري تجهيز المقطع {i + 1} من {clip_count}.\n"
                     f"📋 المقاطع المكتملة: {completed} — المتبقية: {remaining_before}."
                 )
 
@@ -278,6 +278,302 @@ def process_recorded_video(url, chat_id):
                 run_ffmpeg(chat_id, command, timeout=RECORDED_CONVERT_TIMEOUT)
 
                 if is_stopped(chat_id):
+                    raise InterruptedError("تم إيقاف العمل.")
+
+                send_document(chat_id, result, f"المقطع {i + 1} من {clip_count} — 60 ثانية")
+                completed += 1
+                send_message(
+                    chat_id,
+                    f"✅ تم إرسال المقطع {completed} من {clip_count}.\n"
+                    f"📋 المتبقي: {clip_count - completed} مقطع."
+                )
+
+            send_message(chat_id, "🎉 انتهت معالجة الفيديو المسجل وإرسال جميع المقاطع!")
+
+    except InterruptedError:
+        send_message(chat_id, "⏹ تم إيقاف المعالجة.")
+    except Exception as exc:
+        traceback.print_exc()
+        print(f"RECORDED ERROR: {type(exc).__name__}: {exc}", flush=True)
+        if is_stopped(chat_id):
+            send_message(chat_id, "⏹ تم إيقاف المعالجة.")
+        else:
+            send_message(chat_id, f"❌ فشلت معالجة الفيديو المسجل: {type(exc).__name__}: {exc}")
+    finally:
+        with JOBS_LOCK:
+            JOBS.pop(chat_id, None)
+
+
+def convert_live_segment(chat_id, segment_file, output_file, ffmpeg):
+    command = [
+        ffmpeg, "-y", "-i", segment_file,
+        "-map", "0:v:0", "-map", "0:a?",
+        "-vf",
+        "scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280,fps=30",
+        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "30",
+        "-threads", "2", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "96k",
+        "-movflags", "+faststart", output_file
+    ]
+    run_ffmpeg(chat_id, command, timeout=LIVE_CONVERT_TIMEOUT)
+
+
+def process_youtube_live(url, chat_id):
+    capture_process = None
+    sent_count = 0
+    try:
+        send_message(
+            chat_id,
+            "🔴 جاري الاتصال ببث YouTube Live.\n"
+            "سيتم استقبال المقاطع وتحويلها وإرسالها تباعاً، مدة كل مقطع نحو 60 ثانية."
+        )
+
+        with tempfile.TemporaryDirectory() as folder:
+            capture_dir = os.path.join(folder, "live_segments")
+            os.makedirs(capture_dir, exist_ok=True)
+
+            capture = start_live_capture(
+                url, capture_dir, segment_seconds=LIVE_SEGMENT_SECONDS
+            )
+            capture_process = capture["process"]
+            register_process(chat_id, capture_process)
+
+            send_message(
+                chat_id,
+                f"📡 تم الاتصال بالبث: {capture.get('title', 'YouTube Live')}.\n"
+                "📋 الحالة: بانتظار اكتمال أول مقطع."
+            )
+
+            ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+            processed_files = set()
+            last_status_count = -1
+
+            while True:
+                if is_stopped(chat_id):
+                    raise InterruptedError("تم إيقاف استقبال البث.")
+
+                segments = sorted(
+                    glob.glob(os.path.join(capture_dir, "live_*.ts"))
+                )
+                capture_finished = capture_process.poll() is not None
+
+                # While capture is running, the newest TS file is still being written.
+                # Once another segment appears, all earlier files are closed and safe.
+                ready_segments = segments if capture_finished else segments[:-1]
+
+                for segment_file in ready_segments:
+                    if segment_file in processed_files:
+                        continue
+                    if is_stopped(chat_id):
+                        raise InterruptedError("تم إيقاف استقبال البث.")
+
+                    processed_files.add(segment_file)
+                    segment_number = sent_count + 1
+                    output_file = os.path.join(
+                        folder, f"live_clip_{segment_number}.mp4"
+                    )
+
+                    send_message(
+                        chat_id,
+                        f"⚙ اكتمل جزء جديد من البث. جاري تحويل المقطع {segment_number}.\n"
+                        f"✅ المقاطع المرسلة: {sent_count}."
+                    )
+
+                    convert_live_segment(
+                        chat_id, segment_file, output_file, ffmpeg
+                    )
+
+                    if is_stopped(chat_id):
+                        raise InterruptedError("تم إيقاف استقبال البث.")
+
+                    send_document(
+                        chat_id,
+                        output_file,
+                        f"YouTube Live — المقطع {segment_number} — نحو 60 ثانية"
+                    )
+                    sent_count += 1
+
+                    try:
+                        os.remove(segment_file)
+                    except OSError:
+                        pass
+                    try:
+                        os.remove(output_file)
+                    except OSError:
+                        pass
+
+                    send_message(
+                        chat_id,
+                        f"✅ تم إرسال المقطع {sent_count} من البث المباشر.\n"
+                        "📡 الحالة: استقبال البث مستمر وانتظار الجزء التالي."
+                    )
+
+                if capture_finished:
+                    # The capture process has ended; the final segment is now closed.
+                    remaining_segments = [
+                        path for path in segments if path not in processed_files
+                    ]
+                    if not remaining_segments:
+                        break
+
+                time.sleep(LIVE_POLL_SECONDS)
+
+            if sent_count:
+                send_message(
+                    chat_id,
+                    f"🎉 انتهى استقبال البث وإرسال المقاطع.\n"
+                    f"إجمالي المقاطع المرسلة: {sent_count}."
+                )
+            else:
+                raise RuntimeError("انتهى البث دون العثور على مقاطع مكتملة.")
+
+    except InterruptedError:
+        send_message(
+            chat_id,
+            f"⏹ تم إيقاف استقبال البث.\nالمقاطع التي أُرسلت: {sent_count}."
+        )
+    except Exception as exc:
+        traceback.print_exc()
+        print(f"LIVE ERROR: {type(exc).__name__}: {exc}", flush=True)
+        if is_stopped(chat_id):
+            send_message(
+                chat_id,
+                f"⏹ تم إيقاف استقبال البث.\nالمقاطع التي أُرسلت: {sent_count}."
+            )
+        else:
+            send_message(
+                chat_id,
+                f"❌ تعذر استقبال البث: {type(exc).__name__}: {exc}\n"
+                f"المقاطع التي أُرسلت: {sent_count}."
+            )
+    finally:
+        if capture_process is not None:
+            try:
+                stop_live_capture(capture_process)
+            except Exception:
+                traceback.print_exc()
+        with JOBS_LOCK:
+            JOBS.pop(chat_id, None)
+
+
+def process_submitted_url(url, chat_id):
+    if is_live_stream(url):
+        process_youtube_live(url, chat_id)
+    else:
+        process_recorded_video(url, chat_id)
+
+
+def start_pending_link(chat_id, link_id):
+    purge_pending_links()
+    with pending_lock:
+        entry = pending_links.pop(link_id, None)
+    url = entry[0] if entry else None
+    if not url:
+        send_message(chat_id, "انتهت صلاحية الرابط أو تم تشغيله مسبقاً.")
+        return
+
+    with JOBS_LOCK:
+        if chat_id in JOBS:
+            send_message(chat_id, "⚠ يوجد عمل جارٍ بالفعل. أوقفه أولاً.")
+            return
+        JOBS[chat_id] = {
+            "stop_event": threading.Event(),
+            "process": None,
+            "link_id": link_id
+        }
+
+    send_message(chat_id, "▶ بدأ العمل. يمكنك إيقافه من الزر أدناه.")
+    threading.Thread(
+        target=process_submitted_url, args=(url, chat_id), daemon=True
+    ).start()
+
+
+def stop_chat_job(chat_id):
+    with JOBS_LOCK:
+        job = JOBS.get(chat_id)
+        if not job:
+            return False, None
+        job["stop_event"].set()
+        process = job.get("process")
+
+    if process is not None:
+        try:
+            if process.poll() is None:
+                process.terminate()
+        except Exception as exc:
+            print(f"Stop process error: {exc}", flush=True)
+
+    return True, process
+
+
+def make_control_keyboard(link_id):
+    return {
+        "inline_keyboard": [[
+            {"text": "▶ ابدأ العمل", "callback_data": f"start:{link_id}"},
+            {"text": "⏹ إيقاف العمل", "callback_data": f"stop:{link_id}"}
+        ]]
+    }
+
+
+@app.route("/", methods=["GET"])
+def home():
+    return "GTA 6 AI Clipper Bot is running!"
+
+
+SEEN_UPDATES = []
+SEEN_UPDATES_SET = set()
+SEEN_LOCK = threading.Lock()
+
+
+def is_duplicate_update(update_id):
+    """Telegram re-sends an update if it did not get a fast 200; ignore repeats."""
+    with SEEN_LOCK:
+        if update_id in SEEN_UPDATES_SET:
+            return True
+        SEEN_UPDATES.append(update_id)
+        SEEN_UPDATES_SET.add(update_id)
+        if len(SEEN_UPDATES) > 500:
+            SEEN_UPDATES_SET.discard(SEEN_UPDATES.pop(0))
+        return False
+
+
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    if WEBHOOK_SECRET:
+        received = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+        if received != WEBHOOK_SECRET:
+            return "Forbidden", 403
+
+    data = request.get_json(silent=True) or {}
+    update_id = data.get("update_id")
+    if update_id is not None and is_duplicate_update(update_id):
+        return "OK", 200
+
+    # Always answer 200 so Telegram never retries a failing update in a loop.
+    try:
+        handle_update(data)
+    except Exception:
+        traceback.print_exc()
+    return "OK", 200
+
+
+def handle_update(data):
+    callback = data.get("callback_query")
+
+    if callback:
+        callback_id = callback.get("id")
+        callback_data = callback.get("data") or ""
+        chat_id = callback.get("message", {}).get("chat", {}).get("id")
+
+        if callback_data.startswith("start:") and chat_id:
+            answer_callback_query(callback_id, "بدء العمل")
+            start_pending_link(chat_id, callback_data.split(":", 1)[1])
+        elif callback_data.startswith("stop:") and chat_id:
+            answer_callback_query(callback_id, "تم إرسال طلب الإيقاف")
+            stopped, _ = stop_chat_job(chat_id)
+            send_message(
+                chat_id,
+                "⏹ تم إرسالstopped(chat_id):
                     raise InterruptedError("تم إيقاف العمل.")
 
                 send_document(chat_id, result, f"المقطع {i + 1} من {clip_count} — 60 ثانية")
