@@ -1,3 +1,4 @@
+import os
 import cv2
 import numpy as np
 
@@ -118,4 +119,95 @@ def select_best_clips(path, clip_seconds=60, max_clips=10):
             if len(chosen) >= max_clips:
                 break
     return sorted(chosen, key=lambda x: x["start"])
-    
+
+
+def detect_facecam_region(path, max_samples=10):
+    """
+    يقدّر مستطيل نافذة Facecam اعتماداً على ثبات اكتشاف الوجه في موضع متقارب
+    عبر عدة إطارات. يعيد (x, y, w, h) أو None عند عدم كفاية الثقة.
+    """
+    try:
+        cascade_path = os.path.join(cv2.data.haarcascades, "haarcascade_frontalface_default.xml")
+        detector = cv2.CascadeClassifier(cascade_path)
+        if detector.empty():
+            return None
+    except Exception:
+        return None
+
+    cap = cv2.VideoCapture(path)
+    if not cap.isOpened():
+        return None
+
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    if width < 160 or height < 120 or frame_count < 1:
+        cap.release()
+        return None
+
+    # نأخذ عينات موزعة بدلاً من فحص كل الإطارات لتقليل استهلاك Render.
+    positions = np.linspace(0, max(0, frame_count - 1), num=min(max_samples, frame_count), dtype=int)
+    detections = []
+    for pos in positions:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, int(pos))
+        ok, frame = cap.read()
+        if not ok:
+            continue
+        scale = min(1.0, 640.0 / max(width, height))
+        if scale < 1.0:
+            frame = cv2.resize(frame, (int(width * scale), int(height * scale)))
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        faces = detector.detectMultiScale(
+            gray, scaleFactor=1.12, minNeighbors=5,
+            minSize=(max(24, int(28 * scale)), max(24, int(28 * scale)))
+        )
+        for (x, y, w, h) in faces:
+            # تجاهل الوجوه الكبيرة جداً التي غالباً تملأ الشاشة وليست نافذة Facecam.
+            if w > gray.shape[1] * 0.35 or h > gray.shape[0] * 0.55:
+                continue
+            detections.append((x / scale, y / scale, w / scale, h / scale))
+    cap.release()
+
+    if len(detections) < 2:
+        return None
+
+    # تجميع الاكتشافات المتقاربة مكانياً؛ الوجه الثابت عبر الإطارات أرجح أن يكون Facecam.
+    clusters = []
+    for box in detections:
+        cx = box[0] + box[2] / 2
+        cy = box[1] + box[3] / 2
+        matched = None
+        for cluster in clusters:
+            mx = np.mean([b[0] + b[2] / 2 for b in cluster])
+            my = np.mean([b[1] + b[3] / 2 for b in cluster])
+            if abs(cx - mx) <= width * 0.16 and abs(cy - my) <= height * 0.16:
+                matched = cluster
+                break
+        if matched is None:
+            clusters.append([box])
+        else:
+            matched.append(box)
+
+    clusters.sort(key=lambda c: (len(c), np.mean([b[2] * b[3] for b in c])), reverse=True)
+    best = clusters[0]
+    if len(best) < 2:
+        return None
+
+    fx = int(np.median([b[0] for b in best]))
+    fy = int(np.median([b[1] for b in best]))
+    fw = int(np.median([b[2] for b in best]))
+    fh = int(np.median([b[3] for b in best]))
+
+    # توسيع حدود الوجه لتقدير نافذة الكاميرا كاملة (تقريب لاكتشاف حدود overlay).
+    roi_w = int(fw * 2.8)
+    roi_h = int(fh * 2.5)
+    x = int(fx + fw / 2 - roi_w / 2)
+    y = int(fy + fh / 2 - roi_h * 0.48)
+    x = max(0, min(width - 1, x))
+    y = max(0, min(height - 1, y))
+    roi_w = max(1, min(width - x, roi_w))
+    roi_h = max(1, min(height - y, roi_h))
+    if roi_w < width * 0.10 or roi_h < height * 0.10:
+        return None
+    return (x, y, roi_w, roi_h)
+        
