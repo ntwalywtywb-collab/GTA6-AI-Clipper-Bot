@@ -18,7 +18,7 @@ import numpy as np
 
 from flask import Flask, request
 from live_stream import start_live_capture, stop_live_capture
-from ai_engine import analyze_video, select_best_clips
+from ai_engine import analyze_video, select_best_clips, detect_facecam_region
 from chat_analyzer import start_chat_monitor
 
 app = Flask(__name__)
@@ -154,12 +154,72 @@ def run_ffmpeg(chat_id, command, timeout=900):
 
 
 def get_ffmpeg_filter(chat_id, video_path=None):
+    """
+    يبني مرشح FFmpeg بحسب الزر المختار.
+    Facecam mode: يضع نافذة الوجه أعلى اللعب، بعد اكتشاف تقريبي للوجه.
+    Fullscreen mode: يحافظ على القص العمودي القديم 0.45 إذا لم تُكتشف Facecam.
+    """
     mode = USER_PREFERENCES.get(chat_id, "fullscreen")
+    region = None
+    frame_w = frame_h = 0
+    if video_path:
+        try:
+            cap = cv2.VideoCapture(video_path)
+            if cap.isOpened():
+                frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+                frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+            cap.release()
+            region = detect_facecam_region(video_path)
+        except Exception as exc:
+            print(f"Facecam detection skipped: {exc}", flush=True)
+
+    if region and frame_w > 0 and frame_h > 0:
+        cam_x, cam_y, cam_w, cam_h = region
+
+        # نافذة اللعب: نزيل جانب الكاميرا إذا كانت قرب الحافة؛
+        # إذا كانت داخل الصورة نختار الجانب الأوسع لتقليل فقدان اللعب.
+        left_space = cam_x
+        right_space = frame_w - (cam_x + cam_w)
+        if cam_x + cam_w >= frame_w * 0.78:
+            game_x, game_w = 0, max(1, cam_x)
+        elif cam_x <= frame_w * 0.22:
+            game_x, game_w = min(frame_w - 1, cam_x + cam_w), max(1, right_space)
+        elif left_space >= right_space:
+            game_x, game_w = 0, max(1, cam_x)
+        else:
+            game_x, game_w = min(frame_w - 1, cam_x + cam_w), max(1, right_space)
+
+        if mode == "facecam":
+            # 380px للكاميرا بالأعلى و900px للعبة بالأسفل.
+            return (
+                f"[0:v]crop={cam_w}:{cam_h}:{cam_x}:{cam_y},"
+                "scale=720:380:force_original_aspect_ratio=decrease,"
+                "pad=720:380:(ow-iw)/2:(oh-ih)/2[cam];"
+                f"[0:v]crop={game_w}:{frame_h}:{game_x}:0,"
+                "scale=720:900:force_original_aspect_ratio=decrease,"
+                "pad=720:900:(ow-iw)/2:(oh-ih)/2[game];"
+                "[cam][game]vstack=inputs=2,fps=30[vout]"
+            )
+
+        # وضع المعالجة الفائقة: قص منطقة الكاميرا أولاً ثم تكوين 9:16.
+        return (
+            f"[0:v]crop={game_w}:{frame_h}:{game_x}:0,"
+            "scale=720:1280:force_original_aspect_ratio=increase,"
+            "crop=720:1280:(iw-720)/2:(ih-1280)/2,fps=30[vout]"
+        )
+
+    # لا توجد Facecam موثوقة: لا نقص عشوائياً.
     if mode == "facecam":
-        return "scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2,fps=30"
-    else:
-        # قص عمودي 9:16 بدقة 720x1280 مع إزاحة أفقية خفيفة
-        return "scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280:(in_w*0.45-360):(in_h-1280)/2,fps=30"
+        return (
+            "[0:v]scale=720:1280:force_original_aspect_ratio=decrease,"
+            "pad=720:1280:(ow-iw)/2:(oh-ih)/2,fps=30[vout]"
+        )
+
+    # الحفاظ على إعداد القص القديم 0.45 عند عدم اكتشاف كاميرا.
+    return (
+        "[0:v]scale=720:1280:force_original_aspect_ratio=increase,"
+        "crop=720:1280:(iw*0.45-360):(ih-1280)/2,fps=30[vout]"
+    )
 
 
 def process_recorded_video(url, chat_id):
@@ -204,7 +264,7 @@ def process_recorded_video(url, chat_id):
             if not downloaded:
                 raise RuntimeError("لم يتم العثور على ملف الفيديو بعد التحميل.")
             filename = max(downloaded, key=os.path.getsize)
-            vf_filter = get_ffmpeg_filter(chat_id, filename)
+            filter_graph = get_ffmpeg_filter(chat_id, filename)
 
             send_message(chat_id, "🧠 جاري تحليل الحركة وترتيب أفضل المقاطع...")
             selected = select_best_clips(filename, CLIP_LENGTH_SECONDS, max_clips=10)
@@ -219,7 +279,7 @@ def process_recorded_video(url, chat_id):
                 result = os.path.join(folder, f"clip_{index}.mp4")
                 command = [
                     ffmpeg, "-y", "-ss", str(start), "-i", filename,
-                    "-t", str(CLIP_LENGTH_SECONDS), "-vf", vf_filter,
+                    "-t", str(CLIP_LENGTH_SECONDS), "-filter_complex", filter_graph, "-map", "[vout]", "-map", "0:a?",
                     "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
                     "-threads", "2", "-pix_fmt", "yuv420p",
                     "-c:a", "aac", "-b:a", "128k",
@@ -251,12 +311,12 @@ def process_recorded_video(url, chat_id):
             JOBS.pop(chat_id, None)
 
 def convert_live_segment(chat_id, segment_file, output_file, ffmpeg, start=0):
-    vf_filter = get_ffmpeg_filter(chat_id)
+    filter_graph = get_ffmpeg_filter(chat_id, segment_file)
     command = [
         ffmpeg, "-y", "-ss", str(start), "-i", segment_file,
         "-t", str(CLIP_LENGTH_SECONDS),
         "-map", "0:v:0", "-map", "0:a?",
-        "-vf", vf_filter,
+        "-filter_complex", filter_graph, "-map", "[vout]",
         "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
         "-threads", "2", "-pix_fmt", "yuv420p",
         "-c:a", "aac", "-b:a", "128k",
@@ -378,7 +438,7 @@ def start_pending_link(chat_id, link_id):
             "link_id": link_id
         }
 
-    send_message(chat_id, "▶️ بدأ العمل بالمعالجة الفائقة (إزاحة 0.45).")
+    send_message(chat_id, "▶️ بدأ العمل بالوضع المختار. سيتم اكتشاف Facecam تلقائياً إذا أمكن.")
     threading.Thread(target=process_submitted_url, args=(url, chat_id), daemon=True).start()
 
 
@@ -404,8 +464,8 @@ def make_control_keyboard(link_id):
     return {
         "inline_keyboard": [
             [
-                {"text": "⚡ معالجة فائقة السرعة (0.45)", "callback_data": f"mode:fullscreen:{link_id}"},
-                {"text": "🎥 وسط + Facecam", "callback_data": f"mode:facecam:{link_id}"}
+                {"text": "⚡ معالجة فائقة (0.45)", "callback_data": f"mode:fullscreen:{link_id}"},
+                {"text": "🎥 توسيط + Facecam", "callback_data": f"mode:facecam:{link_id}"}
             ],
             [
                 {"text": "▶️ ابدأ العمل", "callback_data": f"start:{link_id}"},
@@ -438,8 +498,8 @@ def webhook():
             USER_PREFERENCES[chat_id] = mode
             
             mode_names = {
-                "fullscreen": "معالجة فائقة السرعة (0.45)",
-                "facecam": "وسط + Facecam"
+                "fullscreen": "معالجة فائقة (0.45)",
+                "facecam": "توسيط + Facecam"
             }
             answer_callback_query(callback_id, f"تم اختيار: {mode_names.get(mode, mode)}")
             
@@ -457,51 +517,4 @@ def webhook():
             start_pending_link(chat_id, callback_data.split(":", 1)[1])
         elif callback_data.startswith("stop:") and chat_id:
             answer_callback_query(callback_id, "تم إرسال طلب الإيقاف")
-            stopped, _ = stop_chat_job(chat_id)
-            send_message(
-                chat_id,
-                "⏹️ تم إرسال طلب إيقاف العمل." if stopped
-                else "لا يوجد عمل جارٍ لإيقافه."
-            )
-        else:
-            answer_callback_query(callback_id, "طلب غير معروف")
-
-        return "OK", 200
-
-    message = data.get("message", {})
-    chat_id = message.get("chat", {}).get("id")
-    text = message.get("text", "").strip()
-
-    if not chat_id or not text:
-        return "OK", 200
-
-    if text.startswith("/start"):
-        send_message(
-            chat_id,
-            "🎮 أهلاً بك في بوت معالجة الفيديوهات السريع!\n"
-            "أرسل رابط فيديو، وسيتم تطبيق إزاحة 0.45 بالمقاس 720x1280 بسرعة فائقة."
-        )
-    elif text.startswith(("http://", "https://")):
-        link_id = uuid.uuid4().hex[:12]
-        with pending_lock:
-            pending_links[link_id] = text
-
-        USER_PREFERENCES[chat_id] = "fullscreen"
-
-        send_message(
-            chat_id,
-            "🎛️ تم استلام الرابط وتفعيل وضع (المعالجة السريعة 0.45).\n"
-            "اضغط (ابدأ العمل) للبدء:",
-            reply_markup=make_control_keyboard(link_id)
-        )
-    else:
-        send_message(chat_id, "أرسل رابط فيديو أو رابط YouTube Live أولاً.")
-
-    return "OK", 200
-
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
-
-        
+            stopped, _ = st
