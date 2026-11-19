@@ -145,10 +145,16 @@ def get_live_stream(url):
     }
 
 
-def start_live_capture(url, output_dir, segment_seconds=60):
+LIVE_SEGMENT_SECONDS = 180
+
+
+def start_live_capture(url, output_dir, segment_seconds=LIVE_SEGMENT_SECONDS):
+    """Capture closed 180-second segments for later 60-second clip analysis."""
     segment_seconds = int(segment_seconds)
-    if segment_seconds != 60:
-        raise ValueError("مدة أجزاء البث مضبوطة على 60 ثانية.")
+    if segment_seconds != LIVE_SEGMENT_SECONDS:
+        raise ValueError(
+            f"مدة أجزاء البث يجب أن تكون {LIVE_SEGMENT_SECONDS} ثانية."
+        )
 
     os.makedirs(output_dir, exist_ok=True)
     ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
