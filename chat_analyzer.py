@@ -1,74 +1,91 @@
-"""Optional, fail-safe YouTube live-chat activity sampler using pytchat."""
-from __future__ import annotations
-
+import re
 import threading
 import time
-from collections import deque
-from typing import Deque, Dict, Optional
+from urllib.parse import urlparse, parse_qs
 
 
-class LiveChatAnalyzer:
-    def __init__(self, video_id: str, window_seconds: int = 30):
-        self.video_id = video_id
-        self.window_seconds = max(5, int(window_seconds))
-        self.events: Deque[tuple] = deque(maxlen=2000)
-        self._chat = None
-        self._thread: Optional[threading.Thread] = None
-        self._stop = threading.Event()
-        self.available = False
+def extract_video_id(url):
+    parsed = urlparse(url)
+    host = (parsed.netloc or "").lower()
+    if host.endswith("youtu.be"):
+        return parsed.path.strip("/").split("/")[0]
+    if "youtube.com" in host:
+        if parsed.path == "/watch":
+            return parse_qs(parsed.query).get("v", [None])[0]
+        parts = [p for p in parsed.path.split("/") if p]
+        if len(parts) >= 2 and parts[0] in ("live", "shorts", "embed"):
+            return parts[1]
+    return None
+
+
+def _elapsed_seconds(value):
+    if not value:
+        return None
+    parts = str(value).split(":")
+    try:
+        total = 0
+        for part in parts:
+            total = total * 60 + int(part)
+        return total
+    except (TypeError, ValueError):
+        return None
+
+
+class LiveChatMonitor:
+    """مراقب اختياري للتعليقات؛ فشل الدردشة لا يوقف معالجة الفيديو."""
+    def __init__(self, url):
+        self.video_id = extract_video_id(url)
+        self.events = []
+        self.lock = threading.Lock()
+        self.stop_event = threading.Event()
+        self.thread = None
         self.error = None
+        self.available = False
 
-    def start(self) -> bool:
-        """Start optional chat polling. Returns False if pytchat is unavailable."""
+    def start(self):
+        if not self.video_id:
+            self.error = "تعذر استخراج معرف فيديو YouTube"
+            return self
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+        return self
+
+    def _run(self):
         try:
-            import pytchat  # optional dependency
-            self._chat = pytchat.create(video_id=self.video_id, interruptable=False)
+            import pytchat
+            chat = pytchat.create(video_id=self.video_id, interruptable=False)
             self.available = True
-            self._thread = threading.Thread(target=self._poll, daemon=True)
-            self._thread.start()
-            return True
+            while not self.stop_event.is_set() and chat.is_alive():
+                data = chat.get()
+                items = data.sync_items() if data else []
+                if items:
+                    now_events = []
+                    for item in items:
+                        elapsed = _elapsed_seconds(getattr(item, "elapsedTime", None))
+                        if elapsed is not None:
+                            now_events.append({"time": elapsed, "count": 1})
+                    if now_events:
+                        with self.lock:
+                            self.events.extend(now_events)
+                time.sleep(2)
+            try:
+                chat.terminate()
+            except Exception:
+                pass
         except Exception as exc:
             self.error = str(exc)
             self.available = False
-            return False
 
-    def _poll(self) -> None:
-        while not self._stop.is_set():
-            try:
-                if self._chat is None or not self._chat.is_alive():
-                    self.error = "الدردشة غير متاحة أو انتهى البث"
-                    break
-                data = self._chat.get()
-                now = time.time()
-                for item in data.sync_items():
-                    self.events.append((now, getattr(item, "message", "")))
-            except Exception as exc:
-                self.error = str(exc)
-                time.sleep(2)
-            self._prune()
-            time.sleep(1)
+    def snapshot(self):
+        with self.lock:
+            return list(self.events)
 
-    def _prune(self) -> None:
-        cutoff = time.time() - max(self.window_seconds * 4, 120)
-        while self.events and self.events[0][0] < cutoff:
-            self.events.popleft()
+    def stop(self):
+        self.stop_event.set()
+        if self.thread and self.thread.is_alive():
+            self.thread.join(timeout=3)
 
-    def activity_score(self, at_time: Optional[float] = None) -> Dict:
-        """Return recent message rate; timestamps are local poll times, not video PTS."""
-        now = at_time or time.time()
-        cutoff = now - self.window_seconds
-        count = sum(1 for stamp, _ in self.events if stamp >= cutoff)
-        return {"messages": count,
-                "messages_per_minute": round(count * 60 / self.window_seconds, 1),
-                "available": self.available,
-                "error": self.error}
 
-    def stop(self) -> None:
-        self._stop.set()
-        try:
-            if self._chat is not None:
-                self._chat.terminate()
-        except Exception:
-            pass
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=3)
+def start_chat_monitor(url):
+    return LiveChatMonitor(url).start()
+    
