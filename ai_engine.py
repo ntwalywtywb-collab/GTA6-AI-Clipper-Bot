@@ -1,98 +1,121 @@
-"""Lightweight highlight scoring for GTA clips; OpenCV/NumPy only."""
-from __future__ import annotations
-
-import math
-import os
-import subprocess
-from typing import Dict, List, Optional
-
 import cv2
 import numpy as np
 
 
-def _duration(path: str) -> float:
+def _video_info(path):
     cap = cv2.VideoCapture(path)
-    try:
-        fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
-        frames = cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0.0
-        if fps > 0 and frames > 0:
-            return frames / fps
-        return 0.0
-    finally:
-        cap.release()
+    if not cap.isOpened():
+        raise RuntimeError("تعذر فتح الفيديو للتحليل.")
+    fps = cap.get(cv2.CAP_PROP_FPS) or 0
+    frames = cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0
+    duration = frames / fps if fps > 0 else 0
+    cap.release()
+    return duration, fps
 
 
-def analyze_video(path: str, clip_length: int = 60, sample_every: float = 2.0) -> Dict:
-    """Return the highest-scoring full window in a closed video file.
-
-    Scores visual motion and scene-change intensity. This is a lightweight
-    heuristic, not semantic recognition of explosions, chases, or wins.
+def analyze_video(path, clip_seconds=60, chat_events=None, timeline_offset=0):
     """
-    if not os.path.isfile(path):
-        raise FileNotFoundError(path)
-    duration = _duration(path)
-    if duration < clip_length:
-        return {"start": 0.0, "duration": duration, "score": 0.0,
-                "reasons": ["الفيديو أقصر من مدة المقطع المطلوبة"]}
-
+    يحلل الحركة بصرياً بمعدل عينة يقارب إطاراً واحداً في الثانية.
+    chat_events: قائمة أحداث بالشكل {"time": seconds_from_live_start, "count": n}.
+    """
+    duration, fps = _video_info(path)
+    if duration <= 0:
+        raise RuntimeError("مدة الفيديو غير صالحة للتحليل.")
     cap = cv2.VideoCapture(path)
-    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-    step_frames = max(1, int(fps * sample_every))
-    times: List[float] = []
-    motion: List[float] = []
-    prev: Optional[np.ndarray] = None
-    index = 0
+    sample_step = max(1, int(round(fps))) if fps > 0 else 1
+    scores = []
+    previous = None
+    frame_no = 0
+    second = 0
     while True:
         ok, frame = cap.read()
         if not ok:
             break
-        if index % step_frames == 0:
-            small = cv2.resize(frame, (160, 90), interpolation=cv2.INTER_AREA)
+        if frame_no % sample_step == 0:
+            small = cv2.resize(frame, (320, 180), interpolation=cv2.INTER_AREA)
             gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
-            if prev is not None:
-                diff = cv2.absdiff(gray, prev)
-                motion.append(float(np.mean(diff)))
-                times.append(index / fps)
-            prev = gray
-        index += 1
+            if previous is None:
+                motion = 0.0
+            else:
+                motion = float(cv2.absdiff(gray, previous).mean()) / 255.0
+            # تخفيف أثر اهتزاز الكاميرا/الضجيج البصري
+            scores.append((second, motion))
+            previous = gray
+            second += 1
+        frame_no += 1
     cap.release()
+    if not scores:
+        return {"start": 0, "duration": min(clip_seconds, duration), "score": 0.0,
+                "motion": 0.0, "chat": 0}
+    max_start = max(0, int(duration - clip_seconds))
+    starts = list(range(0, max_start + 1, 5))
+    if not starts or starts[-1] != max_start:
+        starts.append(max_start)
+    chat_events = chat_events or []
+    best = None
+    for start in starts:
+        end = start + clip_seconds
+        motion_values = [v for t, v in scores if start <= t < end]
+        motion_score = float(np.mean(motion_values)) if motion_values else 0.0
+        chat_score = 0
+        for event in chat_events:
+            t = int(event.get("time", -1))
+            if timeline_offset + start <= t < timeline_offset + end:
+                chat_score += int(event.get("count", 1))
+        # الحركة هي الأساس؛ التعليقات إشارة مساعدة وليست دليلاً على جودة المشهد.
+        normalized_chat = min(1.0, chat_score / 30.0)
+        total = motion_score * 0.85 + normalized_chat * 0.15
+        candidate = {
+            "start": start, "duration": min(clip_seconds, max(1, duration - start)),
+            "score": total, "motion": motion_score, "chat": chat_score
+        }
+        if best is None or candidate["score"] > best["score"]:
+            best = candidate
+    return best
 
-    if not motion:
-        return {"start": 0.0, "duration": duration, "score": 0.0, "reasons": []}
 
-    values = np.asarray(motion, dtype=np.float32)
-    # Rolling windows; each sample represents approximately sample_every seconds.
-    window = max(1, int(math.ceil(clip_length / sample_every)))
-    if len(values) <= window:
-        best_index = 0
-        best_score = float(np.mean(values))
-    else:
-        sums = np.convolve(values, np.ones(window, dtype=np.float32) / window, mode="valid")
-        best_index = int(np.argmax(sums))
-        best_score = float(sums[best_index])
-
-    start = max(0.0, times[min(best_index, len(times) - 1)] - sample_every)
-    start = min(start, max(0.0, duration - clip_length))
-    return {
-        "start": round(start, 2),
-        "duration": float(clip_length),
-        "score": round(best_score, 3),
-        "reasons": ["تم اختيار الفترة ذات أعلى حركة بصرية نسبياً"],
-    }
-
-
-def extract_best_clip(source: str, destination: str, clip_length: int = 60,
-                      ffmpeg: Optional[str] = None) -> Dict:
-    """Extract the best full-length window; caller supplies FFmpeg executable."""
-    result = analyze_video(source, clip_length=clip_length)
-    if result["duration"] < clip_length:
-        raise ValueError("الفيديو لا يحتوي على مدة كاملة تكفي للمقطع المطلوب.")
-    if not ffmpeg:
-        raise ValueError("يجب تمرير مسار FFmpeg.")
-    command = [ffmpeg, "-hide_banner", "-loglevel", "error", "-ss",
-               str(result["start"]), "-i", source, "-t", str(clip_length),
-               "-map", "0:v:0", "-map", "0:a?", "-c", "copy", "-y", destination]
-    completed = subprocess.run(command, capture_output=True, text=True, timeout=300)
-    if completed.returncode != 0:
-        raise RuntimeError(completed.stderr[-2000:] or "فشل قص المقطع")
-    return result
+def select_best_clips(path, clip_seconds=60, max_clips=10):
+    """يرتب نوافذ الفيديو حسب الحركة ويختار نوافذ غير متداخلة."""
+    duration, fps = _video_info(path)
+    if duration <= 0:
+        raise RuntimeError("مدة الفيديو غير صالحة.")
+    if duration <= clip_seconds:
+        return [{"start": 0, "duration": duration, "score": 0.0}]
+    # نحلل نوافذ متتابعة متداخلة كل 10 ثوانٍ، ثم نختار الأفضل دون تداخل.
+    candidates = []
+    step = max(1, int(round(fps))) if fps > 0 else 1
+    cap = cv2.VideoCapture(path)
+    previous = None
+    frame_no = 0
+    sec = 0
+    per_second = []
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        if frame_no % step == 0:
+            small = cv2.resize(frame, (320, 180), interpolation=cv2.INTER_AREA)
+            gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+            motion = 0.0 if previous is None else float(cv2.absdiff(gray, previous).mean()) / 255.0
+            per_second.append((sec, motion))
+            previous = gray
+            sec += 1
+        frame_no += 1
+    cap.release()
+    max_start = max(0, int(duration - clip_seconds))
+    starts = list(range(0, max_start + 1, 10))
+    if not starts or starts[-1] != max_start:
+        starts.append(max_start)
+    for start in starts:
+        vals = [v for t, v in per_second if start <= t < start + clip_seconds]
+        candidates.append({"start": start, "duration": clip_seconds,
+                           "score": float(np.mean(vals)) if vals else 0.0})
+    candidates.sort(key=lambda x: x["score"], reverse=True)
+    chosen = []
+    for item in candidates:
+        if all(abs(item["start"] - old["start"]) >= clip_seconds for old in chosen):
+            chosen.append(item)
+            if len(chosen) >= max_clips:
+                break
+    return sorted(chosen, key=lambda x: x["start"])
+    
