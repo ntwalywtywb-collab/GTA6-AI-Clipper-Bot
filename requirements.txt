@@ -1,3 +1,4 @@
+
 flask
 requests
 gunicorn
@@ -5,3 +6,6 @@ yt-dlp[default]
 imageio-ffmpeg
 opencv-python-headless
 numpy
+scenedetect
+pytchat
+Pillow
